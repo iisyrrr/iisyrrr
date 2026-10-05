@@ -1,0 +1,48 @@
+# Copie ce fichier en config.yaml puis remplis-le.
+# config.yaml contient tes mots de passe : il n'est JAMAIS envoyé sur GitHub (.gitignore).
+
+# alert_only = le robot envoie les signaux sur Telegram mais ne passe AUCUN ordre
+# live       = le robot passe réellement les ordres
+mode: alert_only
+
+strategy: ema_cross_rsi_atr   # remplacée par ta stratégie dès que tu me la décris
+
+mt5:
+  login: 12345678
+  password: "MOT_DE_PASSE"
+  server: "NomDuBroker-Demo"
+  path: ""                    # optionnel : C:\Program Files\MetaTrader 5\terminal64.exe
+
+telegram:
+  token: "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # donné par @BotFather
+  chat_id: "123456789"                                  # ton identifiant (voir README)
+
+trading:
+  symbols: [EURUSD, GBPUSD, XAUUSD]  # noms EXACTS chez ton broker (ex : EURUSD.r, XAUUSDm…)
+  timeframe: M15                     # M1 M5 M15 M30 H1 H4 D1
+  history_bars: 1000                 # bougies utilisées pour calculer les indicateurs
+  magic: 20261005                    # identifiant des ordres du robot
+  deviation_points: 20               # slippage max accepté
+  max_spread_points: 30              # pas d'entrée si le spread est plus large
+  poll_seconds: 10
+
+risk:
+  risk_per_trade_pct: 0.5     # % de l'équité risqué par trade (perte si SL touché)
+  max_open_positions: 3
+  max_daily_loss_pct: 3.0     # au-delà : plus de nouvelles positions jusqu'au lendemain
+  adaptive:                   # réduit le risque automatiquement en cas de mauvaise série
+    enabled: true
+    lookback_trades: 20
+    min_profit_factor: 1.0
+    reduced_multiplier: 0.5
+
+optimizer:                    # auto-amélioration
+  enabled: true
+  every_days: 7               # fréquence de réoptimisation
+  history_bars: 20000         # historique utilisé (augmente "Max bars in chart" dans MT5 si besoin)
+  trials: 80
+  local_steps: 30
+  in_sample_ratio: 0.7        # 70 % pour chercher, 30 % récents pour valider
+  min_trades_oos: 30          # trades minimum sur la période de validation
+  min_profit_factor_oos: 1.15
+  improvement_margin: 0.10    # doit faire au moins 10 % mieux pour être adopté
