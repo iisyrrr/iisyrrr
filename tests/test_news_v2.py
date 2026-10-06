@@ -88,7 +88,7 @@ class FakeAnalyzer:
     def __init__(self, verdicts):
         self.verdicts = verdicts
 
-    def analyze(self, items, assets):
+    def analyze(self, items, assets, known=None):
         return {i.id: {"id": i.id, **self.verdicts[i.title]} for i in items if i.title in self.verdicts}
 
 

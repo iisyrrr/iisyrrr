@@ -55,7 +55,9 @@ INDEX_ALIASES: dict[str, list[str]] = {
 }
 INDEX_CURRENCY = {"US_INDICES": "USD", "EU_INDICES": "EUR", "UK_INDICES": "GBP", "JP_INDICES": "JPY",
                   "OIL": "USD", "CRYPTO": "USD"}
-# Métaux nommés en toutes lettres par certains brokers : cotés en dollars
+# Devises publiées par le calendrier (XAU, XAG, OIL ont 3 lettres mais ne sont pas des devises)
+FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY"}
+# Métaux nommés en toutes lettres par certains brokers (GOLD = XAU/USD, GOLDEUR = XAU/EUR)
 METAL_ALIASES = {"GOLD": "XAU", "SILVER": "XAG"}
 # Actifs « cotés » dans une devise : la devise de cotation joue en sens inverse
 PRICED_IN_CURRENCY = {"XAU", "XAG"}
@@ -75,6 +77,8 @@ def symbol_profile(symbol: str, overrides: dict | None = None) -> dict[str, int]
         if isinstance(ov, dict):
             return {str(k): int(v) for k, v in ov.items()}
         assets = [str(a) for a in ov]
+        if len(assets) == 2 and all(a in FIAT for a in assets):
+            return {assets[0]: 1, assets[1]: -1}  # paire de devises : base puis cotation, comme EURUSD
         priced = [a for a in assets if a in PRICED_IN_CURRENCY]
         indices = [a for a in assets if a in INDEX_CURRENCY]
         profile = {}
@@ -87,7 +91,8 @@ def symbol_profile(symbol: str, overrides: dict | None = None) -> dict[str, int]
     clean = re.sub(r"[^A-Z0-9]", "", symbol.upper())
     for name, metal in METAL_ALIASES.items():
         if clean.startswith(name):
-            return {metal: 1, "USD": -1}
+            quote = clean[len(name):len(name) + 3]
+            return {metal: 1, quote if quote in FIAT else "USD": -1}
     for asset, aliases in INDEX_ALIASES.items():
         if any(clean.startswith(a) for a in aliases):
             return {asset: 1, INDEX_CURRENCY[asset]: 0}

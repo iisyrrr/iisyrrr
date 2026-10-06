@@ -54,7 +54,7 @@ class Analyzer:
     def __init__(self, verdicts=None, error=None, on_call=None):
         self.verdicts, self.error, self.on_call, self.calls = verdicts or {}, error, on_call, 0
 
-    def analyze(self, items, assets):
+    def analyze(self, items, assets, known=None):
         self.calls += 1
         if self.on_call:
             self.on_call()
@@ -156,7 +156,10 @@ class Session:
         return Resp(self.texts.pop(0))
 
 
-FF = json.dumps([{"title": "Non-Farm Employment Change", "country": "USD", "date": "2026-10-09T08:30:00-04:00",
+# comme le vrai fichier : la semaine commence le dimanche (04/10) et finit le vendredi (09/10)
+FF = json.dumps([{"title": "OPEC-JMMC Meetings", "country": "All", "date": "2026-10-04T05:15:00-04:00",
+                  "impact": "Medium", "forecast": "", "previous": ""},
+                 {"title": "Non-Farm Employment Change", "country": "USD", "date": "2026-10-09T08:30:00-04:00",
                   "impact": "High", "forecast": "50K", "previous": "29K"}])
 DENIED = "<html><body>Request Denied. You've exceeded the limit for Calendar Export requests.</body></html>"
 
@@ -164,17 +167,27 @@ DENIED = "<html><body>Request Denied. You've exceeded the limit for Calendar Exp
 def test_ff_rate_limit_page_uses_recent_cache_then_refuses_stale_cache(tmp_path):
     store = NewsStore(tmp_path / "c.db")
     cal = ForexFactoryCalendar(store, min_interval_minutes=60, max_stale_hours=26)
-    assert len(cal.fetch(Session(FF), NOW)) == 1 and cal.data_time == NOW
+    assert len(cal.fetch(Session(FF), NOW)) == 2 and cal.data_time == NOW
     later = NOW + timedelta(hours=5)
-    assert len(cal.fetch(Session(DENIED), later)) == 1 and cal.data_time == NOW  # copie de 5 h : acceptée
+    assert len(cal.fetch(Session(DENIED), later)) == 2 and cal.data_time == NOW  # copie de 5 h : acceptée
     with pytest.raises(RuntimeError):
         cal.fetch(Session(DENIED), NOW + timedelta(hours=30))  # copie de 30 h : refusée
 
 
 def test_ff_calendar_of_a_past_week_is_refused(tmp_path):
-    cal = ForexFactoryCalendar(NewsStore(tmp_path / "c.db"))
+    saturday = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+    assert ForexFactoryCalendar(NewsStore(tmp_path / "a.db")).fetch(Session(FF), saturday)
+    monday = datetime(2026, 10, 12, 6, 0, tzinfo=timezone.utc)  # fichier de la semaine passée
     with pytest.raises(RuntimeError):
-        cal.fetch(Session(FF), NOW + timedelta(days=8))
+        ForexFactoryCalendar(NewsStore(tmp_path / "b.db")).fetch(Session(FF), monday)
+
+
+def test_calendar_ok_requires_current_week_coverage(tmp_path):
+    old_week = [CalendarEvent("CPI m/m", "USD", NOW - timedelta(days=9), "High"),
+                CalendarEvent("NFP", "USD", NOW - timedelta(days=4), "High")]
+    svc = make(tmp_path, [], None, events=old_week)
+    svc.refresh()
+    assert not svc.calendar_ok()  # téléchargé à l'instant, mais c'est la semaine d'avant
 
 
 # ---------------------------------------------------------------- alertes

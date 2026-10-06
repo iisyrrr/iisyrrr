@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -59,6 +60,27 @@ class Bot:
         self.news_required = False
         self._last_sentiment_mode: str | None = None
         self._throttle: dict[str, float] = {}
+        self._spreads: dict[str, deque] = {}
+        self._news_builder = None  # pour retenter le démarrage de la veille si elle a échoué
+        self._news_retry_at = 0.0
+
+    def maybe_retry_news(self) -> None:
+        """Veille en panne au démarrage : on retente toutes les heures plutôt que de bloquer
+        les entrées jusqu'au prochain redémarrage manuel."""
+        if self.news is not None or self._news_builder is None or time.time() < self._news_retry_at:
+            return
+        self._news_retry_at = time.time() + 3600
+        try:
+            news = self._news_builder()
+            if news is None:
+                return
+            news.start()
+        except Exception:
+            log.exception("Nouvel échec du démarrage de la veille news")
+            return
+        self.news = news
+        self.news_required = False
+        self.notifier.send("✅ Veille news redémarrée : les entrées sont de nouveau autorisées.")
 
     def _notify_throttled(self, key: str, text: str, every_seconds: float = 3600) -> None:
         """Envoie au plus un message de ce type par heure (évite d'inonder Telegram)."""
@@ -99,9 +121,9 @@ class Bot:
         )
 
     def run_forever(self) -> None:
-        self.start()
         if self.news:
-            self.news.start()
+            self.news.start()  # charge le calendrier AVANT le message de démarrage et le premier trade
+        self.start()
         try:
             while True:
                 try:
@@ -131,12 +153,28 @@ class Bot:
                 self.process_symbol(symbol)
             except Exception as e:
                 log.exception("Erreur sur %s", symbol)
-                self.notifier.send(f"⚠️ {symbol} : {mask(repr(e))}")
+                self._notify_throttled(f"symbol_error:{symbol}:{e.__class__.__name__}",
+                                       f"⚠️ {symbol} : {mask(repr(e))}")
+        self.maybe_retry_news()
         self.maybe_optimize()
 
     # ================================================================ trading
+    def record_spread(self, symbol: str, points: float) -> None:
+        self._spreads.setdefault(symbol, deque(maxlen=720)).append(points)  # ~2 h à 1 mesure / 10 s
+
+    def typical_spread(self, symbol: str) -> float | None:
+        samples = self._spreads.get(symbol)
+        if not samples or len(samples) < 30:
+            return None  # pas encore assez de mesures : garde-fou inactif
+        return float(np.median(samples))
+
     def process_symbol(self, symbol: str) -> None:
         tf = self.t["timeframe"]
+        if self.t.get("spread_spike_factor"):
+            try:
+                self.record_spread(symbol, self.broker.spec(symbol).spread_points)
+            except Exception:
+                log.debug("Spread de %s indisponible", symbol)
         bar_time = self.broker.rates(symbol, tf, 2).index[-1]
         prev = self.last_bar.get(symbol)
         self.last_bar[symbol] = bar_time
@@ -182,9 +220,10 @@ class Bot:
             self.notifier.send(f"ℹ️ {side_txt} {symbol} ignoré : spread trop large ({spec.spread_points} pts).")
             return
         factor = self.t.get("spread_spike_factor", 0)
-        if factor and "spread" in df:
-            typical = float(np.median(df["spread"].to_numpy()[-500:]))
-            if typical > 0 and spec.spread_points > factor * typical:
+        typical = self.typical_spread(symbol) if factor else None
+        if typical is not None:
+            # spread réel mesuré en continu (pas le minimum des bougies) + écart minimal de 3 points
+            if spec.spread_points > factor * typical and spec.spread_points - typical >= 3:
                 self.notifier.send(
                     f"ℹ️ {side_txt} {symbol} ignoré : spread anormal ({spec.spread_points} pts contre "
                     f"{typical:.0f} habituellement), signe d'une news ou d'un marché illiquide."
@@ -354,7 +393,9 @@ class Bot:
             self.run_optimization()
         elif cmd in ("/news", "/calendar", "/brief"):
             if self.news is None:
-                self.notifier.send("La veille news est désactivée (news.enabled dans config.yaml).")
+                self.notifier.send("🛑 Veille news en panne : entrées bloquées (nouvel essai chaque heure)."
+                                   if self.news_required else
+                                   "La veille news est désactivée (news.enabled dans config.yaml).")
             elif cmd == "/news":
                 self.notifier.send(self.news.news_text())
             elif cmd == "/calendar":
@@ -391,6 +432,8 @@ class Bot:
         lines += [f"  {SIDE_FR[p.side]} {p.symbol} {p.volume} lot @ {p.price_open} → {p.profit:+.2f}"
                   for p in positions]
         lines.append(f"Dernière auto-amélioration : {self.state.last_optimization}")
+        if self.news_required and self.news is None:
+            lines.append("🛑 Veille news en panne : aucune nouvelle position (nouvel essai chaque heure)")
         if self.news:
             lines.append(self.news.status_line())
             lines.append(f"Filtre sentiment : {self.sentiment_mode()}")
@@ -470,14 +513,17 @@ class Bot:
         return decided
 
     def news_alignment_text(self) -> str:
-        stats = self.journal.alignment_stats(self.cfg["news"]["sentiment_threshold"])
+        n = self.cfg["news"]
+        days = n["auto_lookback_days"]
+        since = (self.clock() - timedelta(days=days)).isoformat(timespec="seconds")
+        stats = self.journal.alignment_stats(n["sentiment_threshold"], since)
 
         def fmt(key, label):
-            n, pf = stats[key]
-            return f"{label} : {n} trade(s)" + (f", PF {pf:.2f}" if n else "")
+            count, pf = stats[key]
+            return f"{label} : {count} trade(s)" + (f", PF {pf:.2f}" if count else "")
 
-
-        return ("📰 Trades vs sentiment des news\n" + fmt("aligned", "Dans le sens des news") + "\n"
+        return (f"📰 Trades vs sentiment des news ({days} derniers jours)\n"
+                + fmt("aligned", "Dans le sens des news") + "\n"
                 + fmt("against", "Contre les news") + "\n" + fmt("neutral", "Sentiment neutre/inconnu")
                 + f"\nFiltre actuel : {self.sentiment_mode()}")
 
@@ -497,6 +543,10 @@ def build_bot(cfg: dict, broker, notifier, strategy: Strategy, with_news: bool =
     from .news.factory import build_news_service
 
     data = Path(cfg["data_dir"])
+    n = cfg["news"]
+    # la panne de la veille ne bloque les entrées que si la protection calendrier est réellement demandée
+    protection = bool(n["enabled"] and n["blackout"]["enabled"] and n["blackout"]["fail_closed"]
+                      and n["calendar"]["enabled"])
     news, failed = None, False
     if with_news:
         try:
@@ -504,9 +554,12 @@ def build_bot(cfg: dict, broker, notifier, strategy: Strategy, with_news: bool =
         except Exception as e:  # la veille ne doit jamais empêcher le robot de démarrer
             log.exception("Veille news en panne")
             failed = True
-            notifier.send(f"⚠️ Veille news en panne (erreur de configuration) : {mask(repr(e))}\n"
-                          "Tant qu'elle ne fonctionne pas, aucune nouvelle position (news.blackout.fail_closed).")
+            notifier.send(f"⚠️ Veille news en panne : {mask(repr(e))}\n"
+                          + ("Aucune nouvelle position tant qu'elle ne fonctionne pas (nouvel essai chaque heure)."
+                             if protection else "Le robot trade sans protection news."))
     bot = Bot(cfg, broker, notifier, Journal(data / "journal.db"), StateStore(data), strategy, news=news)
     if failed:
-        bot.news_required = bool(cfg["news"]["blackout"]["fail_closed"])
+        bot.news_required = protection
+        bot._news_builder = lambda: build_news_service(cfg, notifier)
+        bot._news_retry_at = time.time() + 3600
     return bot

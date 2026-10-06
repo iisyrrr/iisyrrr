@@ -189,6 +189,9 @@ class FakeNews:
     def request_brief(self):
         self.brief_requested = True
 
+    def start(self):
+        pass
+
     def news_text(self):
         return "TOP NEWS"
 
@@ -336,11 +339,41 @@ def test_partial_closes_count_as_one_trade(make_bot):
 def test_spread_spike_blocks_entry(make_bot):
     bot, broker, notifier = make_bot()
     bot.tick()
+    for _ in range(40):
+        bot.record_spread("EURUSD", 10)  # spread habituel mesuré en continu : 10 points
     normal_spec = broker.spec
     broker.spec = lambda symbol: SymbolSpec(symbol, 0.00001, 5, 0.01, 100, 0.01, 0, 30, 1.10000, 1.10030)
-    new_bar(bot, broker)  # spread 30 pts alors que la médiane des bougies est 10
+    new_bar(bot, broker)  # spread 30 pts alors que d'habitude il est de 10
     assert broker.orders == []
     assert any("spread anormal" in m for m in notifier.sent)
     broker.spec = normal_spec
     new_bar(bot, broker)
     assert len(broker.orders) == 1
+
+
+def test_spread_guard_inactive_until_enough_samples_and_needs_absolute_excess(make_bot):
+    bot, broker, _ = make_bot()
+    bot.tick()
+    for _ in range(40):
+        bot.record_spread("EURUSD", 1)  # compte ECN : spread quasi nul
+    broker.spec = lambda symbol: SymbolSpec(symbol, 0.00001, 5, 0.01, 100, 0.01, 0, 3, 1.10000, 1.10003)
+    new_bar(bot, broker)  # 3 pts = 3 x l'habituel, mais seulement +2 points : pas une anomalie
+    assert len(broker.orders) == 1
+
+
+def test_symbol_errors_are_throttled(make_bot):
+    bot, broker, notifier = make_bot()
+    broker.rates = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no data"))
+    for _ in range(5):
+        bot.tick()
+    assert sum("no data" in m for m in notifier.sent) == 1
+
+
+def test_news_retry_restores_trading(news_bot):
+    bot, broker, notifier = news_bot(None)
+    bot.news_required = True
+    bot._news_builder = lambda: FakeNews()
+    bot._news_retry_at = 0
+    new_bar(bot, broker)
+    assert bot.news is not None and not bot.news_required
+    assert any("redémarrée" in m for m in notifier.sent)

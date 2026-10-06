@@ -59,13 +59,27 @@ _RUMOR_RE = re.compile(r"\b(sources? say|sources said|reportedly|people familiar
                        r"market talk|chatter|desk talk|according to sources)\b", re.IGNORECASE)
 # Récapitulatifs : utiles pour le briefing, jamais pour une alerte
 _RECAP_RE = re.compile(r"(what are the main events|stock market news for|week ahead|weekly outlook|morning wrap|"
-                       r"markets? wrap|recap\b|live updates?|live blog|^live:|economic calendar for)", re.IGNORECASE)
+                       r"markets? wrap|news wrap|recap\b|live updates?|live blog|\blive:|economic calendar for|"
+                       r"daily open|forex today|market news:|live levels)", re.IGNORECASE)
 # Analyses / prévisions / opinions : contexte seulement
 _ANALYSIS_RE = re.compile(r"(price prediction|price forecast|\bforecast:|technical analysis|chart of the day|"
                           r"elliott wave|trade idea|FJElite|\bopinion:|"
-                          r"currency strength chart|implied volatility|correlation matrix|interest rate probabilities)",
+                          r"currency strength chart|implied volatility|correlation matrix|interest rate probabilities|"
+                          r": market analysis|"
+                          # note de banque citée en fin de titre : « Gold: vulnerable… – OCBC »
+                          r"[–—-]\s*(ING|UOB|OCBC|MUFG|Danske Bank|Commerzbank|Rabobank|SocGen|Soci[ée]t[ée] G[ée]n[ée]rale|"
+                          r"BBH|TDS|TD Securities|Scotiabank|Wells Fargo|Goldman Sachs|Morgan Stanley|Citi|HSBC|BofA|"
+                          r"Nomura|Standard Chartered|Deutsche Bank|Barclays|ANZ|Westpac|NAB|CBA|RBC|BNY|Natixis|"
+                          r"Cr[ée]dit Agricole|Swissquote|Saxo|Pepperstone|Julius Baer|UBS|JPMorgan|BNP Paribas)\s*$)",
                           re.IGNORECASE)
 _NUMBER_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?%?")
+# Mots qui distinguent deux publications différentes malgré des titres presque identiques
+_DISTINCT = {"core", "flash", "final", "prelim", "preliminary", "mom", "yoy", "qoq", "services", "manufacturing",
+             "composite", "headline", "annualized", "german", "germany", "france", "french", "eurozone", "euro",
+             "uk", "us", "japan", "japanese", "china", "chinese", "italy", "italian", "spain", "spanish",
+             "canada", "canadian", "australia", "australian", "swiss", "switzerland", "zealand", "ex"}
+# Gabarit des titres de données (« Actual X (Forecast Y, Previous Z) ») : sans valeur pour comparer
+_TEMPLATE = {"actual", "forecast", "previous", "prior", "est", "exp", "expected", "consensus", "vs", "revised"}
 _STOPWORDS = set(
     "the a an of to in on for and or is are be as at by with from its it this that after over says said "
     "amid vs versus will may could new us de la le les des du et en un une au aux".split()
@@ -84,8 +98,11 @@ class FilterSettings:
 
 
 def normalize_tokens(text: str) -> set[str]:
+    text = re.sub(r"\b([myq])/\1?([myq])\b", lambda m: {"m/m": "mom", "y/y": "yoy", "q/q": "qoq"}.get(
+        m.group(0).lower(), m.group(0)), text, flags=re.IGNORECASE)
     words = re.findall(r"[a-z0-9%.]+", text.lower())
-    return {w.strip(".") for w in words if len(w.strip(".")) > 1 and w not in _STOPWORDS}
+    return {w.strip(".") for w in words
+            if len(w.strip(".")) > 1 and w not in _STOPWORDS and w.strip(".") not in _TEMPLATE}
 
 
 def similarity(a: set[str], b: set[str]) -> float:
@@ -131,10 +148,12 @@ def member_weight(item: NewsItem) -> float:
     return TIER_WEIGHT.get(item.tier, 0.3)
 
 
-def same_story(a: tuple[set[str], set[str]], b: tuple[set[str], set[str]], threshold: float) -> bool:
+def same_story(a: tuple[set[str], list[str]], b: tuple[set[str], list[str]], threshold: float) -> bool:
     (tok_a, num_a), (tok_b, num_b) = a, b
-    if num_a and num_b and not (num_a & num_b):
-        return False  # « -10,6 % » et « -5 % » ne sont pas la même info
+    if num_a and num_b and num_a[0] != num_b[0]:
+        return False  # premier chiffre (souvent le « réel ») différent : « -10,6 % » ≠ « -5 % »
+    if (tok_a ^ tok_b) & _DISTINCT:
+        return False  # CPI ≠ Core CPI, m/m ≠ a/a, Allemagne ≠ zone euro
     return similarity(tok_a, tok_b) >= threshold
 
 
@@ -146,7 +165,7 @@ def deduplicate(items: list[NewsItem], threshold: float) -> list[NewsItem]:
     clusters: list[dict] = []
     by_url: dict[str, int] = {}
     for item in ordered:
-        key = (normalize_tokens(item.title), set(_NUMBER_RE.findall(item.title)))
+        key = (normalize_tokens(item.title), _NUMBER_RE.findall(item.title))
         idx = by_url.get(item.url) if item.url else None
         if idx is None:
             for k, c in enumerate(clusters):
@@ -154,13 +173,16 @@ def deduplicate(items: list[NewsItem], threshold: float) -> list[NewsItem]:
                     idx = k
                     break
         if idx is None:
-            clusters.append({"kept": item, "key": key, "groups": {}, "best_tier": item.tier})
+            clusters.append({"kept": item, "key": key, "groups": {}, "owners": set(), "best_tier": item.tier})
             idx = len(clusters) - 1
             if item.url:
                 by_url[item.url] = idx
         c = clusters[idx]
         c.setdefault("ids", set()).add(item.id)
-        c["groups"][item.owner] = max(c["groups"].get(item.owner, 0.0), member_weight(item))
+        c["owners"].add(item.owner)
+        # tous les posts sociaux ne comptent que pour UN groupe : 10 posts ne valent pas une agence
+        group = "__social__" if item.kind == SOCIAL else item.owner
+        c["groups"][group] = max(c["groups"].get(group, 0.0), member_weight(item))
         if item.kind != SOCIAL:
             c["best_tier"] = min(c["best_tier"], item.tier)
         if item is not c["kept"]:
@@ -168,7 +190,7 @@ def deduplicate(items: list[NewsItem], threshold: float) -> list[NewsItem]:
     out = []
     for c in clusters:
         kept = c["kept"]
-        kept.corroborations = len(c["groups"])
+        kept.corroborations = len(c["owners"])
         kept.corroborated_by_tier = c["best_tier"] if any(
             w > SOCIAL_WEIGHT for w in c["groups"].values()) else 3
         kept.groups = dict(c["groups"])

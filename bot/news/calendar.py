@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from .assets import FIAT
 from .models import CalendarEvent
 
 IMPACT_RANK = {"Holiday": 0, "Low": 1, "Medium": 2, "High": 3}
@@ -37,8 +38,10 @@ def window(event: CalendarEvent, s: BlackoutSettings) -> tuple[datetime, datetim
     return event.time - timedelta(minutes=before), event.time + timedelta(minutes=after)
 
 
-# Devises publiées par le calendrier (XAU, XAG, OIL ont 3 lettres mais ne sont pas des devises)
-FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY"}
+def covers_now(events: list[CalendarEvent], now: datetime) -> bool:
+    """Le calendrier couvre-t-il la semaine en cours ? Le fichier hebdomadaire commence au plus
+    tard 7 jours avant « maintenant » ; un fichier plus ancien est celui d'une semaine passée."""
+    return bool(events) and min(e.time for e in events) >= now - timedelta(days=7, hours=12)
 
 
 def relevant_currencies(assets: set[str], s: BlackoutSettings) -> set[str]:

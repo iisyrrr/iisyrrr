@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from .assets import symbol_assets
+from .calendar import covers_now
 from .models import NEWS, OFFICIAL, SOCIAL, CalendarEvent, NewsItem
 
 log = logging.getLogger(__name__)
@@ -128,8 +129,8 @@ class RssSource(Source):
         if self._modified:
             headers["If-Modified-Since"] = self._modified
         r = http_get(session, self.url, headers=headers)
-        if r.status_code == 304:  # rien de neuf depuis la dernière fois
-            return list(self._last)
+        if r.status_code == 304:  # rien de neuf : on refiltre la dernière version avec l'heure actuelle
+            return [i for i in self._last if valid_time(i.published, now)]
         feed = feedparser.parse(r.content)
         if feed.bozo and not feed.entries:
             raise ValueError(f"flux illisible : {feed.bozo_exception}")
@@ -142,8 +143,8 @@ class RssSource(Source):
                 published = datetime(*stamp[:6], tzinfo=timezone.utc)
             except (ValueError, OverflowError, TypeError):
                 continue  # date sentinelle (an 0 ou 10000) : on ignore juste cette entrée
-            if not valid_time(published, now):
-                continue  # date absurde (1899) ou dans le futur (agenda déguisé en news)
+            if published < OLDEST_VALID:
+                continue  # date absurde (1899)
             title = clean_text(e.get("title"))
             if self.strip_title:
                 title = self.strip_title.sub("", title).strip()
@@ -170,7 +171,8 @@ class RssSource(Source):
         self._etag = r.headers.get("ETag")
         self._modified = r.headers.get("Last-Modified")
         self._last = items
-        return list(items)
+        # les entrées datées dans le futur (agendas) sont écartées maintenant, mais restent en cache
+        return [i for i in items if valid_time(i.published, now)]
 
 
 class SitemapNewsSource(Source):
@@ -280,9 +282,9 @@ class ForexFactoryCalendar(Source):
                 oldest = stamp if oldest is None else min(oldest, stamp)
             except Exception as e:
                 errors.append(e)
-        if errors and not events:
-            raise errors[0]
-        if not events or max(e.time for e in events.values()) < now - timedelta(days=3):
+        if errors:
+            raise errors[0]  # une adresse configurée en panne sans copie utilisable = calendrier incomplet
+        if not covers_now(list(events.values()), now):
             raise RuntimeError("calendrier périmé : il ne couvre pas la semaine en cours")
         self.data_time = oldest
         return sorted(events.values(), key=lambda e: e.time)

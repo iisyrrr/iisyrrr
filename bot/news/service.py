@@ -26,8 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from .assets import symbol_assets, symbol_direction_sign
-from .calendar import FIAT, BlackoutSettings, blackout_event, format_event, relevant_currencies, upcoming
+from .assets import FIAT, symbol_assets, symbol_direction_sign
+from .calendar import BlackoutSettings, blackout_event, covers_now, format_event, relevant_currencies, upcoming
 from .filters import FilterSettings, combined_weight, freshness, impact_hits, member_weight, run_filters, score_item
 from .llm import events_for_prompt, format_brief
 from .models import SOCIAL, CalendarEvent, NewsItem, SymbolContext
@@ -126,7 +126,10 @@ class NewsService:
         self._events: list[CalendarEvent] = []
         self.calendar_data_time: datetime | None = None
         self._alert_times: list[datetime] = []
-        self._alerts_started = False
+        # au démarrage, on n'alerte pas sur ce qui a été publié avant (démarrage - 15 min) : pas de rafale
+        self._alert_floor = clock() - timedelta(minutes=settings.startup_alert_max_age_minutes)
+        self._ai_failures = 0
+        self._ai_warned_at: datetime | None = None
         self._pending_brief: tuple[str, str] | None = None  # (date, texte) prêt mais pas encore envoyé
         self._brief_requested = threading.Event()
         jobs = list(sources) + ([calendar_source] if calendar_source else [])
@@ -231,13 +234,18 @@ class NewsService:
                 todo = [i for i in items if i.analysis is None and i.score >= self.s.llm_min_score]
                 todo = todo[: self.s.llm_max_items]
                 if todo:
+                    # infos récentes déjà analysées : l'IA peut reconnaître qu'une nouvelle info
+                    # rapporte le même événement (dédoublonnage d'un lot à l'autre)
+                    known = [i for i in items if i.analysis is not None and i.analysis.get("relevant")
+                             and now - i.published <= timedelta(hours=6)][:30]
                     try:
-                        results = self.analyzer.analyze(todo, sorted(self.traded_assets))
+                        results = self.analyzer.analyze(todo, sorted(self.traded_assets), known)
                     except Exception:
                         log.exception("Analyse IA impossible pour ce cycle")
-                        results = {}
+                        results = None
+                    self._track_ai_health(results, now)
                     for i in todo:
-                        i.analysis = results.get(i.id)
+                        i.analysis = (results or {}).get(i.id)
             # sauvegarde AVANT la fusion : les analyses des infos fusionnées restent en mémoire
             self.store.save_items(items, now)
             items = self.merge_same_events(items, now)
@@ -252,40 +260,55 @@ class NewsService:
         self.send_alerts(useful, now)
         return useful
 
+    def _track_ai_health(self, results, now: datetime) -> None:
+        """Prévient (au plus toutes les 6 h) si l'IA échoue à répétition : clé révoquée, crédit épuisé…"""
+        if results:
+            self._ai_failures = 0
+            return
+        if results is None or getattr(self.analyzer, "last_error", None):
+            self._ai_failures += 1
+        if self._ai_failures >= 3 and (self._ai_warned_at is None or now - self._ai_warned_at >= timedelta(hours=6)):
+            self._ai_warned_at = now
+            err = getattr(self.analyzer, "last_error", "") or "erreur inconnue"
+            self.notifier.send(f"⚠️ Analyse IA en échec depuis {self._ai_failures} cycles ({err}). "
+                               "La veille continue avec le filtre automatique. Vérifie ta clé / ton crédit Anthropic.")
+
+    @staticmethod
+    def _trust(item: NewsItem) -> tuple:
+        a = item.analysis or {}
+        return (not item.is_rumor, item.category == "news", bool(a.get("relevant", True)),
+                IMPACT_RANK.get(a.get("impact", "none"), 0), member_weight(item), item.weight, -item.tier)
+
     def merge_same_events(self, items: list[NewsItem], now: datetime) -> list[NewsItem]:
         """Fusionne les infos que l'IA a reconnues comme le même événement écrit autrement.
-        Garde-fous : on ne fusionne jamais vers une source moins fiable, ni vers une info
-        que l'IA a jugée sans intérêt alors que celle-ci est importante."""
+        Quel que soit le sens indiqué par l'IA, on garde TOUJOURS la version la plus digne de
+        confiance (fait confirmé > rumeur, info > analyse/récap, impact, fiabilité) et on y
+        fusionne l'autre : une confirmation ne disparaît jamais dans une rumeur."""
         by_id = {i.id: i for i in items}
+        # une info déjà fusionnée dans une autre est représentée par celle-ci
+        owner_of = {mid: i for i in items for mid in i.member_ids}
         merged: set[str] = set()
         for item in items:
-            target_id = (item.analysis or {}).get("same_event_as") or ""
-            seen = {item.id}
-            # suit la chaîne a -> b -> c tant qu'elle reste dans le lot, sans boucle
-            while target_id in by_id and target_id not in seen:
-                nxt = (by_id[target_id].analysis or {}).get("same_event_as") or ""
-                if not nxt or nxt not in by_id or nxt in seen or nxt == target_id:
-                    break
-                seen.add(target_id)
-                target_id = nxt
-            target = by_id.get(target_id)
-            if target is None or target is item or target.id in merged:
+            if item.id in merged:
                 continue
-            if member_weight(target) < member_weight(item):
-                continue  # ne jamais faire disparaître une source fiable au profit d'une moins fiable
-            ta, ia = target.analysis or {}, item.analysis or {}
-            if IMPACT_RANK.get(ta.get("impact", "none"), 0) < IMPACT_RANK.get(ia.get("impact", "none"), 0) or (
-                    ia.get("relevant") and not ta.get("relevant", True)):
-                continue  # la cible a été jugée moins importante : on garde les deux
-            for group, weight in item.groups.items():
-                target.groups[group] = max(target.groups.get(group, 0.0), weight)
-            target.weight = combined_weight(target.groups)
-            target.corroborations = len(target.groups)
-            target.corroborated_by_tier = min(target.corroborated_by_tier, item.corroborated_by_tier)
-            target.assets |= item.assets
-            target.member_ids |= item.member_ids | {item.id}
-            target.score = score_item(target, now, self.s.filters)
-            merged.add(item.id)
+            ref = (item.analysis or {}).get("same_event_as") or ""
+            other = by_id.get(ref) or owner_of.get(ref)
+            seen = {item.id}
+            while other is not None and other.id in merged and other.id not in seen:
+                seen.add(other.id)  # cible déjà fusionnée : on suit vers son représentant
+                other = next((i for i in items if other.id in i.member_ids and i.id not in merged), None)
+            if other is None or other is item or other.id in merged:
+                continue
+            keep, drop = (item, other) if self._trust(item) > self._trust(other) else (other, item)
+            for group, weight in drop.groups.items():
+                keep.groups[group] = max(keep.groups.get(group, 0.0), weight)
+            keep.weight = combined_weight(keep.groups)
+            keep.corroborations = max(keep.corroborations, len(keep.groups))
+            keep.corroborated_by_tier = min(keep.corroborated_by_tier, drop.corroborated_by_tier)
+            keep.assets |= drop.assets
+            keep.member_ids |= drop.member_ids | {drop.id}
+            keep.score = score_item(keep, now, self.s.filters)
+            merged.add(drop.id)
         return [i for i in items if i.id not in merged]
 
     # ================================================================ alertes
@@ -293,9 +316,8 @@ class NewsService:
         # sans Telegram configuré, on considère le message « livré » (sinon on réessaierait sans fin)
         return ok or not getattr(self.notifier, "enabled", True)
 
-    def is_alert_worthy(self, item: NewsItem, now: datetime, first_cycle: bool = False) -> bool:
-        max_age = self.s.startup_alert_max_age_minutes if first_cycle else self.s.alert_max_age_minutes
-        if now - item.published > timedelta(minutes=max_age):
+    def is_alert_worthy(self, item: NewsItem, now: datetime) -> bool:
+        if now - item.published > timedelta(minutes=self.s.alert_max_age_minutes) or item.published < self._alert_floor:
             return False
         if item.social_only or item.category != "news":
             return False  # rumeur sociale, analyse ou récapitulatif : jamais d'alerte
@@ -310,8 +332,7 @@ class NewsService:
         return item.score >= self.s.alert_min_score and item.weight >= 0.85 and impact_hits(item) >= 1
 
     def send_alerts(self, items: list[NewsItem], now: datetime) -> None:
-        first_cycle, self._alerts_started = not self._alerts_started, True
-        candidates = [i for i in items if self.is_alert_worthy(i, now, first_cycle)]
+        candidates = [i for i in items if self.is_alert_worthy(i, now)]
         if not candidates:
             return
         # une info est « déjà alertée » si N'IMPORTE QUELLE de ses copies l'a été
@@ -456,7 +477,9 @@ class NewsService:
         now = now or self.clock()
         with self._lock:
             t = self.calendar_data_time
-        return t is not None and now - t <= timedelta(hours=self.s.calendar_max_age_hours)
+            events = list(self._events)
+        return (t is not None and now - t <= timedelta(hours=self.s.calendar_max_age_hours)
+                and covers_now(events, now))
 
     def context(self, symbol: str, now: datetime | None = None) -> SymbolContext:
         now = now or self.clock()
@@ -541,8 +564,12 @@ class NewsService:
         last = self.last_refresh.astimezone(self.tz).strftime("%H:%M") if self.last_refresh else "jamais"
         ia = "IA active" if self.analyzer else "IA désactivée"
         line = f"Veille news : {ok}/{len(status)} sources OK, dernière mise à jour {last}, {ia}"
-        if not self.calendar_ok():
-            line += "\n⚠️ Calendrier économique indisponible ou périmé"
+        if self.calendar_source and status.get(self.calendar_source.name) == "en attente":
+            line += "\n⏳ Calendrier économique en cours de chargement"
+        elif not self.calendar_ok():
+            line += "\n⚠️ Calendrier économique indisponible ou périmé : aucune nouvelle entrée"
+        if self.analyzer and self._ai_failures >= 3:
+            line += f"\n⚠️ IA en échec depuis {self._ai_failures} cycles ({getattr(self.analyzer, 'last_error', '')})"
         if self.unrecognized:
             line += (f"\n⚠️ Symbole(s) non reconnu(s) : {', '.join(self.unrecognized)} – aucune protection news. "
                      "Renseigne news.symbol_assets dans config.yaml.")

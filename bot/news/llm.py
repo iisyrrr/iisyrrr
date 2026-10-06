@@ -72,9 +72,10 @@ For each item, return:
 - asset_moves: the likely direction for each affected asset among {assets}. Use "unclear" when
   the effect is ambiguous. Only list assets that are genuinely affected.
 - summary_fr: one factual sentence in French (max 25 words), no hype.
-- same_event_as: if another item of this batch reports the same underlying event (same data release,
-  same statement, same decision), the id of the most reliable such item (lowest tier, then earliest);
-  otherwise an empty string. Never point an item to itself.
+- same_event_as: if another item (of this batch, or one of the already-known items listed in <known> tags)
+  reports the same underlying event (same data release, same statement, same decision), the id of that item;
+  otherwise an empty string. Different releases are different events (CPI vs core CPI, m/m vs y/y,
+  Germany vs euro area). Never point an item to itself. Do not return entries for <known> items.
 Attributes: tier 1 = official or top newswire, 3 = social media; "reliability" combines the independent
 sources reporting the item (0-1); category "analysis" or "recap" means opinion/forecast or summary of known
 facts (usually impact none or low). Never rate a single social media post above medium credibility.
@@ -125,8 +126,15 @@ class ClaudeAnalyzer:
         self.model = model
         self.effort = effort
         self.brief_effort = brief_effort
+        self.last_error = ""  # dernière erreur (affichée dans /status), vide si le dernier appel a réussi
 
     def _parse(self, system: str, user: str, schema, effort: str):
+        result = self._call(system, user, schema, effort)
+        if result is not None:
+            self.last_error = ""
+        return result
+
+    def _call(self, system: str, user: str, schema, effort: str):
         import anthropic
 
         try:
@@ -142,36 +150,40 @@ class ClaudeAnalyzer:
                 fallbacks="default",
             )
         except anthropic.AuthenticationError:
-            log.error("Clé API Anthropic invalide : analyse IA désactivée pour ce cycle")
-            return None
+            return self._fail("clé API Anthropic invalide")
+        except anthropic.PermissionDeniedError:
+            return self._fail("accès refusé par l'API Anthropic")
         except anthropic.RateLimitError:
-            log.warning("Limite de débit Anthropic atteinte, analyse IA reportée")
-            return None
+            return self._fail("limite de débit Anthropic atteinte")
         except anthropic.APIStatusError as e:
-            log.warning("Erreur API Anthropic %s : %s", e.status_code, e.message)
-            return None
-        except anthropic.APIConnectionError as e:
-            log.warning("Connexion à l'API Anthropic impossible : %s", e)
-            return None
-        except ValidationError as e:
+            return self._fail(f"erreur API Anthropic {e.status_code}")
+        except anthropic.APIConnectionError:
+            return self._fail("API Anthropic injoignable")
+        except ValidationError:
             # réponse tronquée (max_tokens) ou refus au milieu du JSON : le SDK valide avant nous
-            log.warning("Réponse IA invalide ou tronquée, analyse ignorée pour ce cycle : %s", str(e)[:200])
-            return None
-        except Exception:
+            return self._fail("réponse IA invalide ou tronquée")
+        except Exception as e:
             log.exception("Erreur inattendue pendant l'analyse IA")
-            return None
+            return self._fail(e.__class__.__name__)
         if response.stop_reason == "refusal":
-            log.warning("Analyse IA refusée par le modèle")
-            return None
+            return self._fail("analyse refusée par le modèle")
         if response.stop_reason == "max_tokens":
-            log.warning("Réponse IA tronquée (max_tokens)")
-            return None
+            return self._fail("réponse IA tronquée")
         return response.parsed_output
 
-    def analyze(self, items: list[NewsItem], assets: list[str]) -> dict[str, dict]:
+    def _fail(self, reason: str):
+        log.warning("Analyse IA ignorée pour ce cycle : %s", reason)
+        self.last_error = reason
+        return None
+
+    def analyze(self, items: list[NewsItem], assets: list[str], known: list[NewsItem] | None = None) -> dict[str, dict]:
         if not items:
             return {}
         user = "Analyse these items:\n\n" + "\n\n".join(_item_xml(i) for i in items)
+        if known:
+            user += ("\n\nAlready-known recent items (context only, for same_event_as):\n"
+                     + "\n".join(f'<known id="{k.id}" source="{html.escape(k.source)}">'
+                                  f'{html.escape(k.title)}</known>' for k in known))
         system = ANALYZE_SYSTEM.replace("{assets}", ", ".join(sorted(assets)))
         result = self._parse(system, user, BatchAnalysis, self.effort)
         if result is None:

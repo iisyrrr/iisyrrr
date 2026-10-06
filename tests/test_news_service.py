@@ -43,7 +43,7 @@ class FakeAnalyzer:
         self.calls = 0
         self.briefs = 0
 
-    def analyze(self, items, assets):
+    def analyze(self, items, assets, known=None):
         self.calls += 1
         out = {}
         for i in items:
