@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 import requests
 
@@ -16,6 +17,7 @@ class TelegramNotifier:
         self.chat_id = str(chat_id or "")
         self.session = session or requests.Session()
         self.offset: int | None = None
+        self._lock = threading.Lock()  # le robot et la veille news envoient en parallèle
 
     @property
     def enabled(self) -> bool:
@@ -23,7 +25,8 @@ class TelegramNotifier:
 
     def _call(self, method: str, **kwargs) -> dict:
         url = self.API.format(token=self.token, method=method)
-        r = self.session.post(url, json=kwargs, timeout=15)
+        with self._lock:
+            r = self.session.post(url, json=kwargs, timeout=15)
         r.raise_for_status()
         return r.json()
 

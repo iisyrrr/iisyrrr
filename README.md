@@ -68,6 +68,7 @@ Remplis `mt5` (login, mot de passe, serveur), `telegram` (token, chat_id) et
 python run_bot.py --test-telegram   # tu dois recevoir un message
 python run_bot.py --backtest        # performance des réglages actuels sur l'historique
 python run_bot.py --optimize        # lance une première auto-amélioration
+python run_bot.py --news            # teste la veille news (agenda, infos filtrées, briefing)
 ```
 
 ### 6. Lancement
@@ -80,6 +81,58 @@ python run_bot.py
 1. **Compte DÉMO + `mode: alert_only`** : le robot envoie les signaux sans trader. Compare avec ton analyse pendant quelques jours.
 2. **Compte DÉMO + `mode: live`** : il trade réellement sur la démo. Laisse-le tourner 2 à 4 semaines.
 3. **Compte RÉEL + `mode: live`** avec un petit `risk_per_trade_pct` (0.25 %), puis augmente progressivement.
+
+## Veille news : calendrier, médias, réseaux sociaux
+
+Le robot surveille en permanence l'actualité qui peut faire bouger tes actifs,
+la **filtre** pour ne garder que l'information fiable, et s'en sert pour te
+prévenir et pour se protéger.
+
+### Ce qu'il collecte (toutes les 5 minutes, gratuitement)
+
+| Type | Sources par défaut | Fiabilité |
+|---|---|---|
+| Calendrier économique | ForexFactory (NFP, CPI, banques centrales… avec prévision et précédent) | — |
+| Officiel | Fed, BCE, Bank of England | tier 1 |
+| Grands médias | Reuters, Bloomberg, WSJ, CNBC, Financial Times | tier 1 |
+| Médias forex (les plus rapides) | FinancialJuice, FXStreet, investingLive (ex-ForexLive), Investing.com | tier 2 |
+| Réseaux sociaux | StockTwits (+ Reddit, X en option) | tier 3 |
+
+### Comment il filtre (pour n'avoir que de l'info de qualité)
+
+1. **Fraîcheur** : rien de plus vieux que 24 h ; le score d'une info baisse de moitié toutes les 6 h.
+2. **Anti-spam** : les posts sociaux promotionnels (« free signals », « DM me », « 100x »…), en majuscules, ou sans engagement sont jetés. Un post social sans vrai mot de marché (taux, inflation, intervention…) est jeté aussi, sauf s'il fait énormément réagir.
+3. **Pertinence** : seules les infos qui touchent tes actifs sont gardées. Pour EURUSD, c'est l'EUR et l'USD (BCE, Lagarde, Fed, Powell, NFP…).
+4. **Dédoublonnage** : la même info reprise par 5 sites compte pour 1 info, « confirmée par 5 sources ». On garde la version de la source la plus fiable.
+5. **Rumeurs** : une info venue seulement des réseaux sociaux reste marquée **RUMEUR** tant qu'un média fiable ne l'a pas confirmée. Elle ne déclenche jamais d'alerte.
+6. **Analyse IA (Claude)**, si une clé API est configurée. Chaque info est jugée sur :
+   - sa pertinence et son impact (fort, moyen, faible, aucun) ;
+   - sa crédibilité, et s'il s'agit d'un fait ou d'une rumeur ;
+   - son effet probable sur chaque devise (ex : USD⬇ EUR⬆) ;
+   - un résumé d'une ligne en français.
+
+   Les récapitulatifs, les opinions et le clickbait sont éliminés. L'IA reconnaît aussi une même info écrite différemment par deux médias. Chaque info n'est analysée qu'une fois, donc pas de double facturation.
+
+### Ce que tu reçois sur Telegram
+
+- **🚨 Alertes** : seulement les infos à fort impact et crédibles, une seule fois chacune, avec un maximum de 6 par heure.
+- **⏰ Rappels** : 15 minutes avant chaque annonce à fort impact sur tes devises.
+- **☀️ Briefing du matin** (7 h 30, heure de Paris) : le thème du jour, les points clés, un biais par actif avec sa raison, les risques, et l'agenda de la journée.
+- **Commandes** : `/news` (infos fiables, puis réseaux sociaux « non confirmé » à part), `/calendar`, `/brief`.
+
+### Comment le robot s'en sert pour trader
+
+- **Fenêtre de sécurité** : aucune nouvelle position de 30 min avant à 30 min après une annonce à fort impact sur une devise du symbole. Pour les annonces majeures (NFP, CPI, banques centrales), c'est de 45 min avant à 60 min après.
+- **Sentiment des news** : chaque alerte de trade affiche le sentiment (de -1 à +1), la prochaine annonce et les 2 infos clés. Si le trade va contre les news, c'est signalé (`warn`) ou bloqué (`block`).
+- **Il apprend** : le sentiment est enregistré avec chaque trade. Le rapport hebdomadaire compare les résultats des trades pris dans le sens des news et contre elles. En mode `sentiment_filter: auto`, le robot bloque seul les trades contre les news dès que ses propres résultats montrent qu'ils perdent.
+
+### Activer l'IA
+
+1. Crée une clé sur [console.anthropic.com](https://console.anthropic.com).
+2. Mets-la dans `config.yaml` (`news.ai.api_key`) ou dans la variable d'environnement `ANTHROPIC_API_KEY`.
+3. Teste : `python run_bot.py --news`. Ça affiche les sources, l'agenda, les infos filtrées et le briefing, et ça l'envoie sur Telegram.
+
+Le modèle utilisé est `claude-opus-5-5`, avec un effort réduit pour le classement des news. L'API est payante à l'usage : surveille ta consommation sur la console Anthropic les premiers jours.
 
 ## Faire tourner le robot 24h/24 (redémarrage automatique)
 
@@ -103,6 +156,9 @@ Si le robot s'arrête, les positions ouvertes restent protégées par leur SL/TP
 | `/resume` | Reprend le trading |
 | `/optimize` | Lance l'auto-amélioration maintenant |
 | `/closeall oui` | Ferme toutes les positions du robot |
+| `/news` | Infos fiables du moment (réseaux sociaux à part, « non confirmé ») |
+| `/calendar` | Agenda économique à venir pour tes devises |
+| `/brief` | Le briefing complet tout de suite |
 
 Les commandes envoyées pendant que le robot est éteint sont ignorées au redémarrage (sécurité).
 
@@ -132,6 +188,7 @@ bot/
   risk.py           taille de lot, perte journalière, risque adaptatif
   notifier.py       Telegram
   journal.py        journal SQLite
+  news/             veille : sources, filtre qualité, calendrier, analyse IA, alertes
   state.py          état persistant (survit aux redémarrages)
 tests/              tests automatiques (`pytest`)
 ```

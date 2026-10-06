@@ -10,6 +10,7 @@ import numpy as np
 
 from .backtest import run_backtest
 from .journal import Journal
+from .news.calendar import format_event
 from .optimizer import OptimizerSettings, optimize
 from .risk import adaptive_multiplier, compute_lot, daily_loss_exceeded
 from .state import StateStore
@@ -26,6 +27,9 @@ HELP = (
     "/resume – reprend le trading\n"
     "/optimize – lance l'auto-amélioration maintenant\n"
     "/closeall oui – ferme TOUTES les positions du robot\n"
+    "/news – les infos importantes du moment\n"
+    "/calendar – l'agenda économique à venir\n"
+    "/brief – le briefing complet maintenant\n"
     "/help – cette aide"
 )
 
@@ -36,7 +40,7 @@ def utcnow() -> datetime:
 
 class Bot:
     def __init__(self, cfg: dict, broker, notifier, journal: Journal, store: StateStore,
-                 strategy: Strategy, clock=utcnow):
+                 strategy: Strategy, clock=utcnow, news=None):
         self.cfg = cfg
         self.broker = broker
         self.notifier = notifier
@@ -48,6 +52,8 @@ class Bot:
         self.last_bar: dict[str, object] = {}
         self._last_error_alert = 0.0
         self._last_multiplier = 1.0
+        self.news = news  # service de veille (optionnel)
+        self._last_sentiment_mode: str | None = None
 
     @property
     def state(self):
@@ -76,11 +82,14 @@ class Bot:
             f"🤖 Robot démarré\nMode : {mode}\nStratégie : {self.strategy.name}\n"
             f"Symboles : {', '.join(self.t['symbols'])} ({self.t['timeframe']})\n"
             f"Équité : {acct.equity:.2f} {acct.currency}\n"
+            f"{self.news.status_line() if self.news else 'Veille news : désactivée'}\n"
             f"{'⏸ EN PAUSE : ' + self.state.pause_reason if self.state.paused else ''}\n{HELP}"
         )
 
     def run_forever(self) -> None:
         self.start()
+        if self.news:
+            self.news.start()
         try:
             while True:
                 try:
@@ -94,6 +103,8 @@ class Bot:
         except KeyboardInterrupt:
             log.info("Arrêt demandé")
         finally:
+            if self.news:
+                self.news.stop()
             self.notifier.send("🛑 Robot arrêté. Les positions ouvertes gardent leurs SL/TP chez le broker.")
             self.broker.shutdown()
 
@@ -163,6 +174,33 @@ class Bot:
             self.notifier.send(f"ℹ️ {side_txt} {symbol} ignoré : SL/TP trop proches pour le broker.")
             return
 
+        news_lines: list[str] = []
+        news_sentiment = None
+        if self.news is not None:
+            ctx = self.news.context(symbol)
+            if ctx.blackout_event:
+                ev = ctx.blackout_event
+                self.notifier.send(
+                    f"🗓 {side_txt} {symbol} ignoré : annonce « {ev.title} » ({ev.currency}) à "
+                    f"{ev.time.astimezone(self.news.tz):%H:%M}, fenêtre de sécurité news."
+                )
+                return
+            news_sentiment = ctx.sentiment
+            if ctx.sentiment is not None:
+                news_lines.append(f"Sentiment news : {ctx.sentiment:+.2f} ({ctx.sentiment_items} info(s) analysée(s))")
+                if sig.side * ctx.sentiment <= -self.cfg["news"]["sentiment_threshold"]:
+                    if self.sentiment_mode() == "block":
+                        self.notifier.send(
+                            f"🧭 {side_txt} {symbol} ignoré : contraire au sentiment des news ({ctx.sentiment:+.2f})."
+                        )
+                        return
+                    news_lines.append("⚠️ Ce trade va CONTRE le sentiment des news")
+            if ctx.next_event:
+                news_lines.append(f"Prochaine annonce forte : {format_event(ctx.next_event, self.news.tz)}")
+            for item in ctx.top_items[:2]:
+                text = item.analysis.get("summary_fr") if item.analysis else item.title
+                news_lines.append(f"• {text} ({item.source})")
+
         entry = spec.ask if sig.side == 1 else spec.bid
         sl = round(entry - sig.side * sig.sl_dist, spec.digits)
         tp = round(entry + sig.side * sig.tp_dist, spec.digits)
@@ -186,10 +224,13 @@ class Bot:
             f"Risque : {lot * loss_1lot:.2f} {acct.currency} ({risk_pct:.2f} %)\n"
             f"Raison : {sig.reason}"
         )
+        if news_lines:
+            details += "\n\n" + "\n".join(news_lines)
         now = self.clock().isoformat(timespec="seconds")
 
         if self.cfg["mode"] != "live":
-            self.journal.record_signal(now, symbol, sig.side, lot, entry, sl, tp, False, 0, sig.reason, params)
+            self.journal.record_signal(now, symbol, sig.side, lot, entry, sl, tp, False, 0, sig.reason, params,
+                                       news_sentiment)
             self.notifier.send(f"📣 SIGNAL {side_txt} {symbol} (non exécuté – mode alertes)\n{details}")
             return
 
@@ -198,7 +239,7 @@ class Bot:
             self.notifier.send(f"❌ Ordre {side_txt} {symbol} REFUSÉ : {res.message}")
             return
         self.journal.record_signal(now, symbol, sig.side, lot, res.price or entry, sl, tp, True,
-                                   res.ticket, sig.reason, params)
+                                   res.ticket, sig.reason, params, news_sentiment)
         self.notifier.send(f"{side_txt} {symbol} — POSITION OUVERTE (#{res.ticket})\n{details}")
 
     def report_closed_trades(self) -> None:
@@ -267,6 +308,15 @@ class Bot:
             elif cmd == "/optimize":
                 self.notifier.send("🧠 Auto-amélioration lancée, ça peut prendre quelques minutes…")
                 self.run_optimization()
+            elif cmd in ("/news", "/calendar", "/brief"):
+                if self.news is None:
+                    self.notifier.send("La veille news est désactivée (news.enabled dans config.yaml).")
+                elif cmd == "/news":
+                    self.notifier.send(self.news.news_text())
+                elif cmd == "/calendar":
+                    self.notifier.send(self.news.calendar_text())
+                else:
+                    self.notifier.send(self.news.brief_text(self.clock()))
             elif cmd == "/closeall":
                 if args[:1] != ["oui"]:
                     self.notifier.send("Confirme avec : /closeall oui")
@@ -296,6 +346,9 @@ class Bot:
         lines += [f"  {SIDE_FR[p.side]} {p.symbol} {p.volume} lot @ {p.price_open} → {p.profit:+.2f}"
                   for p in positions]
         lines.append(f"Dernière auto-amélioration : {self.state.last_optimization}")
+        if self.news:
+            lines.append(self.news.status_line())
+            lines.append(f"Filtre sentiment : {self.sentiment_mode()}")
         for s in self.t["symbols"]:
             lines.append(f"{s} : {self.params_for(s)}")
         return "\n".join(lines)
@@ -336,8 +389,44 @@ class Bot:
             texts.append(rep.summary())
         self.state.last_optimization = self.clock().isoformat()
         self.store.save()
+        if self.news:
+            texts.append(self.news_alignment_text())
         self.notifier.send("🧠 AUTO-AMÉLIORATION\n\n" + "\n\n".join(texts))
         return reports
+
+    # ================================================================ news : apprentissage
+    def sentiment_mode(self) -> str:
+        """off | warn | block. En mode « auto », le robot décide lui-même à partir de ses
+        propres trades : s'il perd de l'argent quand il trade contre le sentiment des news
+        (et nettement plus que dans le sens des news), il se met à bloquer ces trades."""
+        n = self.cfg["news"]
+        mode = n["sentiment_filter"]
+        if mode != "auto":
+            return mode
+        stats = self.journal.alignment_stats(n["sentiment_threshold"])
+        against_n, against_pf = stats["against"]
+        _, aligned_pf = stats["aligned"]
+        decided = ("block" if against_n >= n["auto_min_trades"] and against_pf < 1.0
+                   and against_pf < aligned_pf - 0.2 else "warn")
+        if self._last_sentiment_mode is not None and decided != self._last_sentiment_mode:
+            self.notifier.send(
+                "🧭 Le robot BLOQUE désormais les trades contraires au sentiment des news "
+                f"(PF contre : {against_pf:.2f} sur {against_n} trades, PF dans le sens : {aligned_pf:.2f})."
+                if decided == "block" else "🧭 Les trades contraires au sentiment des news sont de nouveau autorisés."
+            )
+        self._last_sentiment_mode = decided
+        return decided
+
+    def news_alignment_text(self) -> str:
+        stats = self.journal.alignment_stats(self.cfg["news"]["sentiment_threshold"])
+
+        def fmt(key, label):
+            n, pf = stats[key]
+            return f"{label} : {n} trade(s)" + (f", PF {pf:.2f}" if n else "")
+
+        return ("📰 Trades vs sentiment des news\n" + fmt("aligned", "Dans le sens des news") + "\n"
+                + fmt("against", "Contre les news") + "\n" + fmt("neutral", "Sentiment neutre/inconnu")
+                + f"\nFiltre actuel : {self.sentiment_mode()}")
 
     def backtest_report(self) -> str:
         lines = []
@@ -351,6 +440,9 @@ class Bot:
         return "\n".join(lines)
 
 
-def build_bot(cfg: dict, broker, notifier, strategy: Strategy) -> Bot:
+def build_bot(cfg: dict, broker, notifier, strategy: Strategy, with_news: bool = True) -> Bot:
+    from .news.factory import build_news_service
+
     data = Path(cfg["data_dir"])
-    return Bot(cfg, broker, notifier, Journal(data / "journal.db"), StateStore(data), strategy)
+    news = build_news_service(cfg, notifier) if with_news else None
+    return Bot(cfg, broker, notifier, Journal(data / "journal.db"), StateStore(data), strategy, news=news)

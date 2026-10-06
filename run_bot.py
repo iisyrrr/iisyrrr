@@ -4,6 +4,7 @@
     python run_bot.py --test-telegram  # vérifie que les alertes arrivent
     python run_bot.py --backtest       # teste les réglages actuels sur l'historique
     python run_bot.py --optimize       # lance l'auto-amélioration tout de suite
+    python run_bot.py --news           # teste la veille news (sans MT5) et envoie le briefing
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ def main() -> None:
     ap.add_argument("--test-telegram", action="store_true")
     ap.add_argument("--backtest", action="store_true")
     ap.add_argument("--optimize", action="store_true")
+    ap.add_argument("--news", action="store_true")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -47,12 +49,28 @@ def main() -> None:
         print("Message envoyé !" if ok else "Échec : vérifie telegram.token et telegram.chat_id")
         return
 
+    if args.news:
+        from bot.news.factory import build_news_service
+
+        cfg["news"]["enabled"] = True
+        svc = build_news_service(cfg, notifier)
+        svc.refresh()
+        print(svc.status_line())
+        print(svc.dump_status())
+        print(svc.calendar_text(), "\n")
+        print(svc.news_text(15), "\n")
+        brief = svc.brief_text(svc.clock())
+        print(brief)
+        notifier.send(brief)
+        return
+
     from bot.broker import MT5Broker
 
     broker = MT5Broker(cfg["mt5"], cfg["trading"]["magic"], cfg["trading"]["deviation_points"])
-    bot = build_bot(cfg, broker, notifier, get_strategy(cfg["strategy"]))
+    one_shot = args.backtest or args.optimize
+    bot = build_bot(cfg, broker, notifier, get_strategy(cfg["strategy"]), with_news=not one_shot)
 
-    if args.backtest or args.optimize:
+    if one_shot:
         broker.connect()
         try:
             if args.backtest:

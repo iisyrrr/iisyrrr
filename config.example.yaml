@@ -46,3 +46,68 @@ optimizer:                    # auto-amélioration
   min_trades_oos: 30          # trades minimum sur la période de validation
   min_profit_factor_oos: 1.15
   improvement_margin: 0.10    # doit faire au moins 10 % mieux pour être adopté
+
+# ============================================================================
+# VEILLE NEWS : calendrier économique, médias, banques centrales, réseaux sociaux
+# ============================================================================
+news:
+  enabled: true
+  poll_minutes: 5               # fréquence de collecte
+  timezone: "Europe/Paris"      # heure affichée dans les alertes et le briefing
+  morning_brief_time: "07:30"   # briefing du matin sur Telegram ("" = désactivé)
+  brief_weekends: false
+  max_alerts_per_hour: 6        # anti-spam
+  event_reminder_minutes: 15    # rappel avant chaque annonce à fort impact (0 = off)
+
+  # Que faire si un signal va CONTRE le sentiment des news ?
+  #   off   = ignorer   | warn = trader mais le signaler dans l'alerte
+  #   block = ne pas trader
+  #   auto  = le robot décide seul : il passe en "block" s'il constate sur ses propres
+  #           trades (au moins auto_min_trades) que ceux pris contre les news perdent
+  sentiment_filter: warn
+  sentiment_threshold: 0.5      # sentiment de -1 à +1 ; |sentiment| >= 0.5 = clair
+  auto_min_trades: 30
+
+  # Pas de nouvelle position autour des annonces à fort impact sur les devises du symbole
+  blackout:
+    enabled: true
+    impacts: [High]
+    minutes_before: 30
+    minutes_after: 30
+    major_minutes_before: 45    # NFP, CPI, décisions de banques centrales…
+    major_minutes_after: 60
+
+  # Filtrage par IA (Claude) : pertinence, impact, crédibilité, rumeur ou fait,
+  # effet probable sur chaque devise, résumé en français, briefing du matin.
+  # Sans clé, le robot utilise seulement le filtre automatique (moins fin).
+  ai:
+    enabled: true
+    api_key: ""                 # clé sur console.anthropic.com (ou variable ANTHROPIC_API_KEY)
+    model: claude-opus-5-5
+    effort: low                 # classement des news : low suffit et coûte moins
+    brief_effort: medium        # briefing du matin
+    max_items_per_cycle: 25
+
+  # Les sources par défaut (Fed, BCE, BoE, Reuters, Bloomberg, WSJ, CNBC, FT,
+  # FinancialJuice, FXStreet, investingLive, Investing.com, StockTwits) sont
+  # activées automatiquement. Pour en AJOUTER sans les remplacer :
+  extra_sources: []
+  #  - type: reddit             # appli "script" gratuite sur https://www.reddit.com/prefs/apps
+  #    subreddits: [Forex, economics]
+  #    client_id: ""
+  #    client_secret: ""
+  #  - type: x                  # API X (payante)
+  #    bearer_token: ""
+  #    accounts: [federalreserve, ecb, bankofengland]
+  #    official_accounts: [federalreserve, ecb, bankofengland]
+  #  - type: finnhub            # clé gratuite sur finnhub.io
+  #    api_key: ""
+  #  - type: rss                # n'importe quel flux RSS
+  #    name: "Mon flux"
+  #    url: "https://exemple.com/feed"
+  #    tier: 2                  # 1 = officiel/agence majeure, 2 = média spécialisé, 3 = social
+  # Pour REMPLACER complètement la liste par défaut, utilise "sources:" à la place.
+
+  # Si le nom d'un symbole n'est pas reconnu (ex : un indice exotique), indique ses actifs :
+  symbol_assets: {}
+  #  MONINDICE: [US_INDICES, USD]

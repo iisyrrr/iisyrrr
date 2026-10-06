@@ -165,3 +165,93 @@ def test_closeall_requires_confirmation(make_bot):
     notifier.inbox = ["/closeall oui"]
     bot.tick()
     assert broker.positions_list == []
+
+
+# ---------------------------------------------------------------- veille news
+from datetime import timedelta, timezone as tz
+from zoneinfo import ZoneInfo
+
+from bot.news.models import CalendarEvent, NewsItem, SymbolContext
+
+
+class FakeNews:
+    def __init__(self, sentiment=None, blackout=None):
+        self.sentiment, self.blackout = sentiment, blackout
+        self.tz = ZoneInfo("Europe/Paris")
+
+    def context(self, symbol):
+        item = NewsItem("Wire", "news", 1, "Fed signals pause", "u", datetime(2026, 1, 5, 11, tzinfo=timezone.utc))
+        return SymbolContext(symbol, self.sentiment, 3 if self.sentiment is not None else 0, [item], None,
+                             self.blackout)
+
+    def news_text(self):
+        return "TOP NEWS"
+
+    def calendar_text(self):
+        return "AGENDA"
+
+    def brief_text(self, now):
+        return "BRIEF"
+
+    def status_line(self):
+        return "Veille news : test"
+
+
+@pytest.fixture
+def news_bot(make_bot):
+    def _make(news, **news_cfg):
+        bot, broker, notifier = make_bot()
+        bot.news = news
+        bot.cfg["news"].update(news_cfg)
+        bot.tick()
+        return bot, broker, notifier
+    return _make
+
+
+def test_no_entry_during_news_blackout(news_bot):
+    nfp = CalendarEvent("Non-Farm Employment Change", "USD", datetime(2026, 1, 5, 12, 20, tzinfo=timezone.utc), "High")
+    bot, broker, notifier = news_bot(FakeNews(blackout=nfp))
+    new_bar(bot, broker)
+    assert broker.orders == []
+    assert any("Non-Farm" in m and "ignoré" in m for m in notifier.sent)
+
+
+def test_sentiment_block_mode(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="block")
+    new_bar(bot, broker)  # AlwaysBuy contre un sentiment très baissier
+    assert broker.orders == []
+    assert any("contraire au sentiment" in m for m in notifier.sent)
+
+
+def test_sentiment_warn_mode_trades_with_warning_and_context(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="warn")
+    new_bar(bot, broker)
+    assert len(broker.orders) == 1
+    opened = next(m for m in notifier.sent if "POSITION OUVERTE" in m)
+    assert "CONTRE le sentiment" in opened and "Fed signals pause" in opened
+
+
+def test_sentiment_recorded_in_journal(news_bot):
+    bot, broker, _ = news_bot(FakeNews(sentiment=0.5))
+    new_bar(bot, broker)
+    row = bot.journal.db.execute("SELECT news_sentiment FROM signals").fetchone()
+    assert row == (0.5,)
+
+
+def test_auto_mode_learns_to_block_losing_counter_trend_trades(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="auto", auto_min_trades=5)
+    assert bot.sentiment_mode() == "warn"
+    for k in range(6):  # 6 trades perdants pris contre le sentiment, 6 gagnants dans le sens
+        bot.journal.record_signal("t", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 100 + k, "r", {}, -0.8)
+        bot.journal.record_close("t", ClosedDeal(1000 + k, 100 + k, "EURUSD", 0.1, 1, -50.0, "stop-loss"))
+        bot.journal.record_signal("t", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 200 + k, "r", {}, 0.8)
+        bot.journal.record_close("t", ClosedDeal(2000 + k, 200 + k, "EURUSD", 0.1, 1, 80.0, "take-profit"))
+    assert bot.sentiment_mode() == "block"
+    assert any("BLOQUE désormais" in m for m in notifier.sent)
+
+
+def test_news_commands(news_bot):
+    bot, _, notifier = news_bot(FakeNews())
+    notifier.inbox = ["/news", "/calendar", "/brief"]
+    bot.tick()
+    assert {"TOP NEWS", "AGENDA", "BRIEF"} <= set(notifier.sent)

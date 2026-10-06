@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 
@@ -25,14 +26,19 @@ class Journal:
             );
             """
         )
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(signals)")}
+        if "news_sentiment" not in cols:  # migration des journaux créés avant la veille news
+            self.db.execute("ALTER TABLE signals ADD COLUMN news_sentiment REAL")
         self.db.commit()
 
     def record_signal(self, time: str, symbol: str, side: int, volume: float, entry: float,
-                      sl: float, tp: float, executed: bool, ticket: int, reason: str, params: dict) -> None:
+                      sl: float, tp: float, executed: bool, ticket: int, reason: str, params: dict,
+                      news_sentiment: float | None = None) -> None:
         self.db.execute(
-            "INSERT INTO signals (time, symbol, side, volume, entry, sl, tp, executed, ticket, reason, params)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (time, symbol, side, volume, entry, sl, tp, int(executed), ticket, reason, json.dumps(params)),
+            "INSERT INTO signals (time, symbol, side, volume, entry, sl, tp, executed, ticket, reason, params,"
+            " news_sentiment) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (time, symbol, side, volume, entry, sl, tp, int(executed), ticket, reason, json.dumps(params),
+             news_sentiment),
         )
         self.db.commit()
 
@@ -55,3 +61,27 @@ class Journal:
             (f"{day}%",),
         ).fetchone()
         return int(n), int(wins), float(total)
+
+    def alignment_stats(self, threshold: float) -> dict[str, tuple[int, float]]:
+        """Résultats des trades réels selon qu'ils allaient dans le sens du sentiment
+        des news, contre lui, ou sans sentiment clair : {clé: (nombre, profit factor)}."""
+        rows = self.db.execute(
+            "SELECT s.side, s.news_sentiment, SUM(c.profit) FROM signals s"
+            " JOIN closed c ON c.position_id = s.ticket WHERE s.executed = 1 AND s.ticket > 0"
+            " GROUP BY s.id"
+        ).fetchall()
+        groups: dict[str, list[float]] = {"aligned": [], "against": [], "neutral": []}
+        for side, sentiment, profit in rows:
+            if sentiment is None or abs(sentiment) < threshold:
+                groups["neutral"].append(profit)
+            elif side * sentiment > 0:
+                groups["aligned"].append(profit)
+            else:
+                groups["against"].append(profit)
+
+        def pf(values: list[float]) -> float:
+            gains = sum(v for v in values if v > 0)
+            losses = -sum(v for v in values if v < 0)
+            return gains / losses if losses > 0 else (math.inf if gains > 0 else 0.0)
+
+        return {k: (len(v), pf(v)) for k, v in groups.items()}
