@@ -175,14 +175,19 @@ from bot.news.models import CalendarEvent, NewsItem, SymbolContext
 
 
 class FakeNews:
-    def __init__(self, sentiment=None, blackout=None):
+    def __init__(self, sentiment=None, blackout=None, calendar_ok=True, recognized=True):
         self.sentiment, self.blackout = sentiment, blackout
+        self.calendar_ok, self.recognized = calendar_ok, recognized
         self.tz = ZoneInfo("Europe/Paris")
+        self.brief_requested = False
 
     def context(self, symbol):
         item = NewsItem("Wire", "news", 1, "Fed signals pause", "u", datetime(2026, 1, 5, 11, tzinfo=timezone.utc))
         return SymbolContext(symbol, self.sentiment, 3 if self.sentiment is not None else 0, [item], None,
-                             self.blackout)
+                             self.blackout, self.calendar_ok, self.recognized)
+
+    def request_brief(self):
+        self.brief_requested = True
 
     def news_text(self):
         return "TOP NEWS"
@@ -242,16 +247,100 @@ def test_auto_mode_learns_to_block_losing_counter_trend_trades(news_bot):
     bot, broker, notifier = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="auto", auto_min_trades=5)
     assert bot.sentiment_mode() == "warn"
     for k in range(6):  # 6 trades perdants pris contre le sentiment, 6 gagnants dans le sens
-        bot.journal.record_signal("t", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 100 + k, "r", {}, -0.8)
+        bot.journal.record_signal("2026-01-05T10:00:00", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 100 + k, "r", {}, -0.8)
         bot.journal.record_close("t", ClosedDeal(1000 + k, 100 + k, "EURUSD", 0.1, 1, -50.0, "stop-loss"))
-        bot.journal.record_signal("t", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 200 + k, "r", {}, 0.8)
+        bot.journal.record_signal("2026-01-05T10:00:00", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 200 + k, "r", {}, 0.8)
         bot.journal.record_close("t", ClosedDeal(2000 + k, 200 + k, "EURUSD", 0.1, 1, 80.0, "take-profit"))
     assert bot.sentiment_mode() == "block"
     assert any("BLOQUE désormais" in m for m in notifier.sent)
 
 
 def test_news_commands(news_bot):
-    bot, _, notifier = news_bot(FakeNews())
+    news = FakeNews()
+    bot, _, notifier = news_bot(news)
     notifier.inbox = ["/news", "/calendar", "/brief"]
     bot.tick()
-    assert {"TOP NEWS", "AGENDA", "BRIEF"} <= set(notifier.sent)
+    assert {"TOP NEWS", "AGENDA"} <= set(notifier.sent)
+    assert news.brief_requested  # préparé par la tâche de fond, pas par la boucle de trading
+
+
+def test_failing_command_does_not_drop_following_ones(news_bot):
+    news = FakeNews()
+    news.news_text = lambda: 1 / 0
+    bot, _, notifier = news_bot(news)
+    notifier.inbox = ["/news", "/pause"]
+    bot.tick()
+    assert bot.state.paused
+    assert any("en erreur" in m for m in notifier.sent)
+
+
+def test_calendar_unavailable_fails_closed(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(calendar_ok=False))
+    new_bar(bot, broker)
+    new_bar(bot, broker)
+    assert broker.orders == []
+    assert sum("calendrier économique indisponible" in m for m in notifier.sent) == 1  # message limité
+
+
+def test_calendar_fail_open_when_user_chooses_it(news_bot):
+    bot, broker, _ = news_bot(FakeNews(calendar_ok=False))
+    bot.cfg["news"]["blackout"]["fail_closed"] = False
+    new_bar(bot, broker)
+    assert len(broker.orders) == 1
+
+
+def test_news_service_down_blocks_entries_when_required(news_bot):
+    bot, broker, notifier = news_bot(None)
+    bot.news_required = True
+    new_bar(bot, broker)
+    assert broker.orders == [] and any("veille news est en panne" in m for m in notifier.sent)
+
+
+def test_unrecognized_symbol_is_flagged_in_alert(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(recognized=False))
+    new_bar(bot, broker)
+    assert any("Symbole non reconnu" in m for m in notifier.sent if "POSITION OUVERTE" in m)
+
+
+def test_sentiment_off_means_ignored(news_bot):
+    bot, broker, notifier = news_bot(FakeNews(sentiment=-0.9), sentiment_filter="off")
+    new_bar(bot, broker)
+    opened = next(m for m in notifier.sent if "POSITION OUVERTE" in m)
+    assert "CONTRE" not in opened and "Sentiment news" not in opened
+
+
+def test_auto_mode_blocks_even_without_aligned_trades(news_bot):
+    bot, _, _ = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="auto", auto_min_trades=5)
+    for k in range(6):  # que des trades contre les news, tous perdants, aucun dans le sens
+        bot.journal.record_signal("2026-01-05T10:00:00", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 300 + k, "r", {}, -0.8)
+        bot.journal.record_close("t", ClosedDeal(3000 + k, 300 + k, "EURUSD", 0.1, 1, -50.0, "stop-loss"))
+    assert bot.sentiment_mode() == "block"
+
+
+def test_auto_mode_forgets_old_trades(news_bot):
+    bot, _, _ = news_bot(FakeNews(sentiment=-0.8), sentiment_filter="auto", auto_min_trades=5)
+    for k in range(6):  # trades perdants vieux de plus de 90 jours : ne comptent plus
+        bot.journal.record_signal("2025-06-01T10:00:00", "EURUSD", 1, 0.1, 1, 0.9, 1.2, True, 400 + k, "r", {}, -0.8)
+        bot.journal.record_close("t", ClosedDeal(4000 + k, 400 + k, "EURUSD", 0.1, 1, -50.0, "stop-loss"))
+    assert bot.sentiment_mode() == "warn"
+
+
+def test_partial_closes_count_as_one_trade(make_bot):
+    bot, _, _ = make_bot()
+    bot.journal.record_signal("2026-01-05T10:00:00", "EURUSD", 1, 0.2, 1, 0.9, 1.2, True, 500, "r", {}, 0.8)
+    bot.journal.record_close("t", ClosedDeal(5001, 500, "EURUSD", 0.1, 1, 30.0, "manuel/robot"))
+    bot.journal.record_close("t", ClosedDeal(5002, 500, "EURUSD", 0.1, 1, -10.0, "stop-loss"))
+    assert bot.journal.alignment_stats(0.5)["aligned"] == (1, 99.0)
+
+
+def test_spread_spike_blocks_entry(make_bot):
+    bot, broker, notifier = make_bot()
+    bot.tick()
+    normal_spec = broker.spec
+    broker.spec = lambda symbol: SymbolSpec(symbol, 0.00001, 5, 0.01, 100, 0.01, 0, 30, 1.10000, 1.10030)
+    new_bar(bot, broker)  # spread 30 pts alors que la médiane des bougies est 10
+    assert broker.orders == []
+    assert any("spread anormal" in m for m in notifier.sent)
+    broker.spec = normal_spec
+    new_bar(bot, broker)
+    assert len(broker.orders) == 1

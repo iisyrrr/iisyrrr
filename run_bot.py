@@ -14,6 +14,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from bot import secrets
 from bot.config import load_config
 from bot.engine import build_bot
 from bot.notifier import TelegramNotifier
@@ -28,6 +29,7 @@ def setup_logging(data_dir: str) -> None:
     console = logging.StreamHandler(sys.stdout)
     for h in (file_handler, console):
         h.setFormatter(fmt)
+        h.addFilter(secrets.SecretFilter())  # aucun jeton / clé API en clair dans les journaux
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, console])
 
 
@@ -41,6 +43,7 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    secrets.register_from_config(cfg)
     setup_logging(cfg["data_dir"])
     notifier = TelegramNotifier(cfg["telegram"]["token"], cfg["telegram"]["chat_id"])
 

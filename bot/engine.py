@@ -13,6 +13,7 @@ from .journal import Journal
 from .news.calendar import format_event
 from .optimizer import OptimizerSettings, optimize
 from .risk import adaptive_multiplier, compute_lot, daily_loss_exceeded
+from .secrets import mask
 from .state import StateStore
 from .strategy import Strategy
 
@@ -53,7 +54,18 @@ class Bot:
         self._last_error_alert = 0.0
         self._last_multiplier = 1.0
         self.news = news  # service de veille (optionnel)
+        # True si la veille a été demandée (avec fail_closed) mais n'a pas pu démarrer :
+        # dans ce cas on n'ouvre aucune position sans protection (voir build_bot)
+        self.news_required = False
         self._last_sentiment_mode: str | None = None
+        self._throttle: dict[str, float] = {}
+
+    def _notify_throttled(self, key: str, text: str, every_seconds: float = 3600) -> None:
+        """Envoie au plus un message de ce type par heure (évite d'inonder Telegram)."""
+        now = time.time()
+        if now - self._throttle.get(key, 0) >= every_seconds:
+            self._throttle[key] = now
+            self.notifier.send(text)
 
     @property
     def state(self):
@@ -98,7 +110,7 @@ class Bot:
                     log.exception("Erreur dans la boucle")
                     if time.time() - self._last_error_alert > 900:
                         self._last_error_alert = time.time()
-                        self.notifier.send(f"⚠️ Erreur : {e!r}\nLe robot continue de tourner.")
+                        self.notifier.send(f"⚠️ Erreur : {mask(repr(e))}\nLe robot continue de tourner.")
                 time.sleep(self.t["poll_seconds"])
         except KeyboardInterrupt:
             log.info("Arrêt demandé")
@@ -119,7 +131,7 @@ class Bot:
                 self.process_symbol(symbol)
             except Exception as e:
                 log.exception("Erreur sur %s", symbol)
-                self.notifier.send(f"⚠️ {symbol} : {e!r}")
+                self.notifier.send(f"⚠️ {symbol} : {mask(repr(e))}")
         self.maybe_optimize()
 
     # ================================================================ trading
@@ -169,6 +181,15 @@ class Bot:
         if spec.spread_points > self.t["max_spread_points"]:
             self.notifier.send(f"ℹ️ {side_txt} {symbol} ignoré : spread trop large ({spec.spread_points} pts).")
             return
+        factor = self.t.get("spread_spike_factor", 0)
+        if factor and "spread" in df:
+            typical = float(np.median(df["spread"].to_numpy()[-500:]))
+            if typical > 0 and spec.spread_points > factor * typical:
+                self.notifier.send(
+                    f"ℹ️ {side_txt} {symbol} ignoré : spread anormal ({spec.spread_points} pts contre "
+                    f"{typical:.0f} habituellement), signe d'une news ou d'un marché illiquide."
+                )
+                return
         min_dist = spec.stops_level * spec.point
         if sig.sl_dist < min_dist or sig.tp_dist < min_dist:
             self.notifier.send(f"ℹ️ {side_txt} {symbol} ignoré : SL/TP trop proches pour le broker.")
@@ -176,8 +197,21 @@ class Bot:
 
         news_lines: list[str] = []
         news_sentiment = None
+        if self.news is None and self.news_required:
+            self._notify_throttled("news_down", f"🛑 {side_txt} {symbol} ignoré : la veille news est en panne "
+                                                "(protection autour des annonces impossible).")
+            return
         if self.news is not None:
             ctx = self.news.context(symbol)
+            if not ctx.calendar_ok and self.cfg["news"]["blackout"]["fail_closed"]:
+                self._notify_throttled(
+                    "calendar_down",
+                    f"🛑 {side_txt} {symbol} ignoré : calendrier économique indisponible ou périmé, la protection "
+                    "autour des annonces n'est pas garantie. (Désactivable : news.blackout.fail_closed)")
+                return
+            if not ctx.recognized:
+                news_lines.append("⚠️ Symbole non reconnu par la veille : aucune protection news "
+                                  "(renseigne news.symbol_assets)")
             if ctx.blackout_event:
                 ev = ctx.blackout_event
                 self.notifier.send(
@@ -186,10 +220,11 @@ class Bot:
                 )
                 return
             news_sentiment = ctx.sentiment
-            if ctx.sentiment is not None:
+            mode = self.sentiment_mode()
+            if ctx.sentiment is not None and mode != "off":
                 news_lines.append(f"Sentiment news : {ctx.sentiment:+.2f} ({ctx.sentiment_items} info(s) analysée(s))")
                 if sig.side * ctx.sentiment <= -self.cfg["news"]["sentiment_threshold"]:
-                    if self.sentiment_mode() == "block":
+                    if mode == "block":
                         self.notifier.send(
                             f"🧭 {side_txt} {symbol} ignoré : contraire au sentiment des news ({ctx.sentiment:+.2f})."
                         )
@@ -293,37 +328,47 @@ class Bot:
     # ================================================================ commandes Telegram
     def handle_commands(self) -> None:
         for text in self.notifier.poll_commands():
-            parts = text.split()
-            cmd = parts[0].lower().split("@")[0]
-            args = [a.lower() for a in parts[1:]]
-            if cmd == "/status":
-                self.notifier.send(self.status_text())
-            elif cmd == "/pause":
-                self.pause("pause manuelle")
-                self.notifier.send("⏸ Robot en pause (aucune nouvelle entrée).")
-            elif cmd == "/resume":
-                self.state.paused, self.state.pause_reason = False, ""
-                self.store.save()
-                self.notifier.send("▶️ Robot relancé.")
-            elif cmd == "/optimize":
-                self.notifier.send("🧠 Auto-amélioration lancée, ça peut prendre quelques minutes…")
-                self.run_optimization()
-            elif cmd in ("/news", "/calendar", "/brief"):
-                if self.news is None:
-                    self.notifier.send("La veille news est désactivée (news.enabled dans config.yaml).")
-                elif cmd == "/news":
-                    self.notifier.send(self.news.news_text())
-                elif cmd == "/calendar":
-                    self.notifier.send(self.news.calendar_text())
-                else:
-                    self.notifier.send(self.news.brief_text(self.clock()))
-            elif cmd == "/closeall":
-                if args[:1] != ["oui"]:
-                    self.notifier.send("Confirme avec : /closeall oui")
-                else:
-                    self.close_all()
+            try:
+                self.handle_command(text)
+            except Exception as e:  # une commande en erreur ne doit pas faire perdre les suivantes
+                log.exception("Commande %s en erreur", text)
+                self.notifier.send(f"⚠️ Commande {text.split()[0] if text.split() else text} en erreur : {mask(repr(e))}")
+
+    def handle_command(self, text: str) -> None:
+        parts = text.split()
+        if not parts:
+            return
+        cmd = parts[0].lower().split("@")[0]
+        args = [a.lower() for a in parts[1:]]
+        if cmd == "/status":
+            self.notifier.send(self.status_text())
+        elif cmd == "/pause":
+            self.pause("pause manuelle")
+            self.notifier.send("⏸ Robot en pause (aucune nouvelle entrée).")
+        elif cmd == "/resume":
+            self.state.paused, self.state.pause_reason = False, ""
+            self.store.save()
+            self.notifier.send("▶️ Robot relancé.")
+        elif cmd == "/optimize":
+            self.notifier.send("🧠 Auto-amélioration lancée, ça peut prendre quelques minutes…")
+            self.run_optimization()
+        elif cmd in ("/news", "/calendar", "/brief"):
+            if self.news is None:
+                self.notifier.send("La veille news est désactivée (news.enabled dans config.yaml).")
+            elif cmd == "/news":
+                self.notifier.send(self.news.news_text())
+            elif cmd == "/calendar":
+                self.notifier.send(self.news.calendar_text())
             else:
-                self.notifier.send(HELP)
+                self.news.request_brief()  # l'IA peut être lente : jamais dans la boucle de trading
+                self.notifier.send("☀️ Briefing en préparation, il arrive dans un instant…")
+        elif cmd == "/closeall":
+            if args[:1] != ["oui"]:
+                self.notifier.send("Confirme avec : /closeall oui")
+            else:
+                self.close_all()
+        else:
+            self.notifier.send(HELP)
 
     def close_all(self) -> None:
         positions = self.broker.positions()
@@ -403,15 +448,22 @@ class Bot:
         mode = n["sentiment_filter"]
         if mode != "auto":
             return mode
-        stats = self.journal.alignment_stats(n["sentiment_threshold"])
+        since = (self.clock() - timedelta(days=n["auto_lookback_days"])).isoformat(timespec="seconds")
+        stats = self.journal.alignment_stats(n["sentiment_threshold"], since)
         against_n, against_pf = stats["against"]
-        _, aligned_pf = stats["aligned"]
-        decided = ("block" if against_n >= n["auto_min_trades"] and against_pf < 1.0
-                   and against_pf < aligned_pf - 0.2 else "warn")
+        aligned_n, aligned_pf = stats["aligned"]
+        min_n = n["auto_min_trades"]
+        decided = "warn"
+        if against_n >= min_n and against_pf < 1.0:
+            # on compare au sens des news seulement si cet échantillon est suffisant
+            if aligned_n < min_n or against_pf < aligned_pf - 0.2:
+                decided = "block"
         if self._last_sentiment_mode is not None and decided != self._last_sentiment_mode:
+            aligned_txt = f"{aligned_pf:.2f} sur {aligned_n} trades" if aligned_n else "pas encore de trades"
             self.notifier.send(
                 "🧭 Le robot BLOQUE désormais les trades contraires au sentiment des news "
-                f"(PF contre : {against_pf:.2f} sur {against_n} trades, PF dans le sens : {aligned_pf:.2f})."
+                f"(PF contre : {against_pf:.2f} sur {against_n} trades, PF dans le sens : {aligned_txt}). "
+                f"Il réexaminera la question sur les {n['auto_lookback_days']} derniers jours."
                 if decided == "block" else "🧭 Les trades contraires au sentiment des news sont de nouveau autorisés."
             )
         self._last_sentiment_mode = decided
@@ -423,6 +475,7 @@ class Bot:
         def fmt(key, label):
             n, pf = stats[key]
             return f"{label} : {n} trade(s)" + (f", PF {pf:.2f}" if n else "")
+
 
         return ("📰 Trades vs sentiment des news\n" + fmt("aligned", "Dans le sens des news") + "\n"
                 + fmt("against", "Contre les news") + "\n" + fmt("neutral", "Sentiment neutre/inconnu")
@@ -444,5 +497,16 @@ def build_bot(cfg: dict, broker, notifier, strategy: Strategy, with_news: bool =
     from .news.factory import build_news_service
 
     data = Path(cfg["data_dir"])
-    news = build_news_service(cfg, notifier) if with_news else None
-    return Bot(cfg, broker, notifier, Journal(data / "journal.db"), StateStore(data), strategy, news=news)
+    news, failed = None, False
+    if with_news:
+        try:
+            news = build_news_service(cfg, notifier)
+        except Exception as e:  # la veille ne doit jamais empêcher le robot de démarrer
+            log.exception("Veille news en panne")
+            failed = True
+            notifier.send(f"⚠️ Veille news en panne (erreur de configuration) : {mask(repr(e))}\n"
+                          "Tant qu'elle ne fonctionne pas, aucune nouvelle position (news.blackout.fail_closed).")
+    bot = Bot(cfg, broker, notifier, Journal(data / "journal.db"), StateStore(data), strategy, news=news)
+    if failed:
+        bot.news_required = bool(cfg["news"]["blackout"]["fail_closed"])
+    return bot

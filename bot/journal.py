@@ -62,13 +62,16 @@ class Journal:
         ).fetchone()
         return int(n), int(wins), float(total)
 
-    def alignment_stats(self, threshold: float) -> dict[str, tuple[int, float]]:
+    def alignment_stats(self, threshold: float, since: str | None = None) -> dict[str, tuple[int, float]]:
         """Résultats des trades réels selon qu'ils allaient dans le sens du sentiment
-        des news, contre lui, ou sans sentiment clair : {clé: (nombre, profit factor)}."""
+        des news, contre lui, ou sans sentiment clair : {clé: (nombre, profit factor)}.
+        Les clôtures partielles d'une même position sont additionnées (1 trade).
+        Profit factor plafonné à 99 (aucune perte) ; 0 si aucun trade."""
         rows = self.db.execute(
             "SELECT s.side, s.news_sentiment, SUM(c.profit) FROM signals s"
             " JOIN closed c ON c.position_id = s.ticket WHERE s.executed = 1 AND s.ticket > 0"
-            " GROUP BY s.id"
+            " AND s.time >= ? GROUP BY s.id",
+            (since or "",),
         ).fetchall()
         groups: dict[str, list[float]] = {"aligned": [], "against": [], "neutral": []}
         for side, sentiment, profit in rows:
@@ -82,6 +85,6 @@ class Journal:
         def pf(values: list[float]) -> float:
             gains = sum(v for v in values if v > 0)
             losses = -sum(v for v in values if v < 0)
-            return gains / losses if losses > 0 else (math.inf if gains > 0 else 0.0)
+            return min(99.0, gains / losses) if losses > 0 else (99.0 if gains > 0 else 0.0)
 
         return {k: (len(v), pf(v)) for k, v in groups.items()}

@@ -32,11 +32,17 @@ def is_major(event: CalendarEvent) -> bool:
 def window(event: CalendarEvent, s: BlackoutSettings) -> tuple[datetime, datetime]:
     before, after = ((s.major_minutes_before, s.major_minutes_after) if is_major(event)
                      else (s.minutes_before, s.minutes_after))
+    if "press conference" in event.title.lower():
+        after = max(after, 90)  # une conférence dure ~1 h : on couvre jusqu'à 30 min après la fin
     return event.time - timedelta(minutes=before), event.time + timedelta(minutes=after)
 
 
+# Devises publiées par le calendrier (XAU, XAG, OIL ont 3 lettres mais ne sont pas des devises)
+FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY"}
+
+
 def relevant_currencies(assets: set[str], s: BlackoutSettings) -> set[str]:
-    out = {a for a in assets if len(a) == 3}
+    out = {a for a in assets if a in FIAT}
     for a in assets:
         out |= set(s.extra_currencies.get(a, []))
     return out

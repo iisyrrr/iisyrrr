@@ -24,6 +24,7 @@ class NewsStore:
             );
             CREATE INDEX IF NOT EXISTS items_published ON items(published);
             CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, updated TEXT);
+            CREATE TABLE IF NOT EXISTS alerted (id TEXT PRIMARY KEY, at TEXT);
             """
         )
         self.db.commit()
@@ -55,17 +56,19 @@ class NewsStore:
         return {r[0]: json.loads(r[1]) for r in rows}
 
     def alerted_ids(self, ids: list[str]) -> set[str]:
-        if not ids:
-            return set()
+        """Parmi ces ids (toutes les copies d'une info), ceux qui ont déjà fait l'objet d'une alerte."""
+        out: set[str] = set()
         with self._lock:
-            rows = self.db.execute(
-                f"SELECT id FROM items WHERE alerted = 1 AND id IN ({','.join('?' * len(ids))})", ids
-            ).fetchall()
-        return {r[0] for r in rows}
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                rows = self.db.execute(
+                    f"SELECT id FROM alerted WHERE id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+                out |= {r[0] for r in rows}
+        return out
 
-    def mark_alerted(self, ids: list[str]) -> None:
+    def mark_alerted(self, ids: list[str], now: datetime) -> None:
         with self._lock:
-            self.db.executemany("UPDATE items SET alerted = 1 WHERE id = ?", [(i,) for i in ids])
+            self.db.executemany("INSERT OR IGNORE INTO alerted VALUES (?, ?)", [(i, now.isoformat()) for i in ids])
             self.db.commit()
 
     def get(self, key: str) -> tuple[str, str] | None:
@@ -82,4 +85,5 @@ class NewsStore:
     def purge(self, before: datetime) -> None:
         with self._lock:
             self.db.execute("DELETE FROM items WHERE published < ?", (before.isoformat(),))
+            self.db.execute("DELETE FROM alerted WHERE at < ?", (before.isoformat(),))
             self.db.commit()

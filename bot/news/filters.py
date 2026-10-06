@@ -9,6 +9,10 @@
 
 Une info venant UNIQUEMENT des réseaux sociaux est marquée « rumeur » tant
 qu'aucun média fiable ne la confirme.
+
+La fiabilité d'une info rapportée par plusieurs groupes INDÉPENDANTS se combine :
+W = 1 - (1 - w1)(1 - w2)… Exemple : FinancialJuice seul 0.75, FinancialJuice +
+FXStreet 0.94. Reuters sur Bluesky et le site de Reuters comptent pour un seul groupe.
 """
 from __future__ import annotations
 
@@ -18,9 +22,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .assets import detect_assets
-from .models import SOCIAL, NewsItem
+from .models import OFFICIAL, SOCIAL, NewsItem
 
-TIER_WEIGHT = {1: 1.0, 2: 0.75, 3: 0.4}
+TIER_WEIGHT = {1: 0.9, 2: 0.75, 3: 0.4}
+OFFICIAL_WEIGHT = 1.0
+SOCIAL_WEIGHT = 0.15  # foule : utile comme signal faible, jamais comme preuve
 
 # Mots qui signalent une info potentiellement importante pour les marchés
 IMPACT_WORDS = [
@@ -43,7 +49,23 @@ SPAM_PATTERNS = [
     r"\bcopy (my )?trades?\b", r"\baccount management\b", r"\bairdrop\b", r"\bgiveaway\b",
     r"\bto the moon\b", r"\bpromo code\b", r"\breferral\b", r"\blink in bio\b",
 ]
+SPAM_PATTERNS += [r"\b(buy|sell) signal\b", r"\btp ?1\b", r"\bsl ?:", r"\bentry zone\b", r"\bvip\b",
+                  r"\brcs score\b"]
 _SPAM_RE = re.compile("|".join(SPAM_PATTERNS), re.IGNORECASE)
+_CASHTAG_RE = re.compile(r"\$[A-Z]{2,6}(?:\.[A-Z])?\b")
+
+# Formulations de rumeur : poids réduit tant qu'une source de premier plan ne confirme pas
+_RUMOR_RE = re.compile(r"\b(sources? say|sources said|reportedly|people familiar|said to be|rumou?rs?|unconfirmed|"
+                       r"market talk|chatter|desk talk|according to sources)\b", re.IGNORECASE)
+# Récapitulatifs : utiles pour le briefing, jamais pour une alerte
+_RECAP_RE = re.compile(r"(what are the main events|stock market news for|week ahead|weekly outlook|morning wrap|"
+                       r"markets? wrap|recap\b|live updates?|live blog|^live:|economic calendar for)", re.IGNORECASE)
+# Analyses / prévisions / opinions : contexte seulement
+_ANALYSIS_RE = re.compile(r"(price prediction|price forecast|\bforecast:|technical analysis|chart of the day|"
+                          r"elliott wave|trade idea|FJElite|\bopinion:|"
+                          r"currency strength chart|implied volatility|correlation matrix|interest rate probabilities)",
+                          re.IGNORECASE)
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?%?")
 _STOPWORDS = set(
     "the a an of to in on for and or is are be as at by with from its it this that after over says said "
     "amid vs versus will may could new us de la le les des du et en un une au aux".split()
@@ -53,7 +75,7 @@ _STOPWORDS = set(
 @dataclass
 class FilterSettings:
     max_age_hours: float = 24.0
-    half_life_hours: float = 6.0  # une info perd la moitié de son score toutes les 6 h
+    half_life_hours: float = 3.0  # une info perd la moitié de son score toutes les 3 h
     dedup_similarity: float = 0.55  # similarité des titres au-delà de laquelle c'est la même info
     social_min_engagement: dict = field(default_factory=lambda: {"score": 25, "likes": 5, "followers": 500})
     # un post social sans mot de marché n'est gardé que s'il fait vraiment réagir
@@ -81,6 +103,8 @@ def is_spam(item: NewsItem) -> bool:
         return True  # titre en MAJUSCULES
     if item.title.count("🚀") + item.title.count("💰") + item.title.count("🔥") >= 3:
         return True
+    if len(set(_CASHTAG_RE.findall(item.title))) >= 4:
+        return True  # liste de tickers = post promotionnel
     return False
 
 
@@ -99,45 +123,81 @@ def impact_hits(item: NewsItem) -> int:
     return len(set(m.lower() for m in _IMPACT_RE.findall(f"{item.title} {item.summary}")))
 
 
+def member_weight(item: NewsItem) -> float:
+    if item.kind == SOCIAL:
+        return SOCIAL_WEIGHT
+    if item.kind == OFFICIAL and item.tier == 1:
+        return OFFICIAL_WEIGHT
+    return TIER_WEIGHT.get(item.tier, 0.3)
+
+
+def same_story(a: tuple[set[str], set[str]], b: tuple[set[str], set[str]], threshold: float) -> bool:
+    (tok_a, num_a), (tok_b, num_b) = a, b
+    if num_a and num_b and not (num_a & num_b):
+        return False  # « -10,6 % » et « -5 % » ne sont pas la même info
+    return similarity(tok_a, tok_b) >= threshold
+
+
 def deduplicate(items: list[NewsItem], threshold: float) -> list[NewsItem]:
     """Regroupe les infos identiques. On garde la version de la source la plus
-    fiable (puis la plus ancienne = la primeur) et on compte les corroborations."""
-    ordered = sorted(items, key=lambda i: (i.tier, i.published))
-    clusters: list[tuple[NewsItem, set[str], set[str], int]] = []  # (gardée, tokens, sources, meilleur tier)
+    fiable (puis la plus ancienne = la primeur). La corroboration se compte par
+    groupe propriétaire indépendant, et les fiabilités se combinent (« ou » bruité)."""
+    ordered = sorted(items, key=lambda i: (-member_weight(i), i.published))
+    clusters: list[dict] = []
     by_url: dict[str, int] = {}
     for item in ordered:
-        tokens = normalize_tokens(item.title)
+        key = (normalize_tokens(item.title), set(_NUMBER_RE.findall(item.title)))
         idx = by_url.get(item.url) if item.url else None
         if idx is None:
-            for k, (_, toks, _, _) in enumerate(clusters):
-                if similarity(tokens, toks) >= threshold:
+            for k, c in enumerate(clusters):
+                if same_story(key, c["key"], threshold):
                     idx = k
                     break
         if idx is None:
-            clusters.append((item, tokens, {item.source}, item.tier))
+            clusters.append({"kept": item, "key": key, "groups": {}, "best_tier": item.tier})
+            idx = len(clusters) - 1
             if item.url:
-                by_url[item.url] = len(clusters) - 1
-        else:
-            kept, toks, sources, best = clusters[idx]
-            sources.add(item.source)
-            clusters[idx] = (kept, toks | tokens if len(toks) < 4 else toks, sources, min(best, item.tier))
-            kept.assets |= item.assets
+                by_url[item.url] = idx
+        c = clusters[idx]
+        c.setdefault("ids", set()).add(item.id)
+        c["groups"][item.owner] = max(c["groups"].get(item.owner, 0.0), member_weight(item))
+        if item.kind != SOCIAL:
+            c["best_tier"] = min(c["best_tier"], item.tier)
+        if item is not c["kept"]:
+            c["kept"].assets |= item.assets
     out = []
-    for kept, _, sources, best in clusters:
-        kept.corroborations = len(sources)
-        kept.corroborated_by_tier = best
+    for c in clusters:
+        kept = c["kept"]
+        kept.corroborations = len(c["groups"])
+        kept.corroborated_by_tier = c["best_tier"] if any(
+            w > SOCIAL_WEIGHT for w in c["groups"].values()) else 3
+        kept.groups = dict(c["groups"])
+        kept.weight = combined_weight(kept.groups)
+        kept.member_ids = set(c["ids"])
         out.append(kept)
     return out
 
 
+def combined_weight(groups: dict) -> float:
+    return round(1 - math.prod(1 - w for w in groups.values()), 4)
+
+
+def categorize(item: NewsItem) -> str:
+    text = item.title
+    if _RECAP_RE.search(text):
+        return "recap"
+    if _ANALYSIS_RE.search(text):
+        return "analysis"
+    return "news"
+
+
 def score_item(item: NewsItem, now: datetime, s: FilterSettings) -> float:
-    """Score de 0 à ~1 : fiabilité x fraîcheur x corroboration x importance."""
-    base = TIER_WEIGHT.get(item.tier, 0.3)
-    if item.kind == SOCIAL and item.corroborated_by_tier <= 2:
-        base = max(base, TIER_WEIGHT[item.corroborated_by_tier] * 0.9)  # rumeur confirmée par un média
-    corroboration = 1 + 0.15 * min(item.corroborations - 1, 4)
-    importance = 1 + 0.2 * min(impact_hits(item), 3)
-    return round(min(1.0, base * freshness(item, now, s.half_life_hours) * corroboration * importance / 1.6), 4)
+    """Score de 0 à 1 : fiabilité combinée x fraîcheur x importance x nature de l'info."""
+    importance = 0.7 + 0.1 * min(impact_hits(item), 3)
+    nature = {"news": 1.0, "analysis": 0.35, "recap": 0.3}[item.category]
+    if _RUMOR_RE.search(f"{item.title} {item.summary}") and item.corroborated_by_tier > 1:
+        nature *= 0.6
+    return round(min(1.0, item.weight * freshness(item, now, s.half_life_hours) * importance * nature), 4)
 
 
 def run_filters(items: list[NewsItem], now: datetime, s: FilterSettings) -> list[NewsItem]:
@@ -160,10 +220,13 @@ def run_filters(items: list[NewsItem], now: datetime, s: FilterSettings) -> list
 
     unique = deduplicate(kept, s.dedup_similarity)
     for item in unique:
+        item.category = categorize(item)
         item.score = score_item(item, now, s)
         item.flags = []
-        if item.is_rumor:
+        if item.social_only:
             item.flags.append("rumeur non confirmée")
+        if item.category != "news":
+            item.flags.append({"analysis": "analyse/opinion", "recap": "récapitulatif"}[item.category])
         if item.corroborations >= 3:
             item.flags.append(f"confirmée par {item.corroborations} sources")
     return sorted(unique, key=lambda i: i.score, reverse=True)

@@ -12,14 +12,26 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
+from .assets import symbol_assets
 from .models import NEWS, OFFICIAL, SOCIAL, CalendarEvent, NewsItem
 
 log = logging.getLogger(__name__)
 
+# Ne jamais utiliser un « Mozilla/5.0 » nu : BLS et investingLive le bloquent.
+# Un robot identifié (avec un contact) est accepté partout.
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TradingBot-News/1.0"
 TIMEOUT = 20
+MAX_BYTES = 5_000_000  # on refuse les réponses anormalement grosses
+OLDEST_VALID = datetime(2000, 1, 1, tzinfo=timezone.utc)  # certains flux contiennent des dates en 1899
+
+
+def set_contact(contact: str) -> None:
+    """Ajoute un contact au User-Agent (demandé par certains sites officiels comme le BLS)."""
+    global USER_AGENT
+    base = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TradingBot-News/1.0"
+    USER_AGENT = f"{base} (+{contact})" if contact else base
 
 # Fiabilité des médias quand la source est un agrégateur (GDELT, Finnhub…)
 DOMAIN_TIER = {
@@ -44,16 +56,45 @@ def domain_tier(url_or_domain: str, default: int = 3) -> int:
     return default
 
 
-def clean_text(text: str | None) -> str:
-    text = re.sub(r"<[^>]+>", " ", text or "")
+def clean_text(text: str | None, limit: int = 5000) -> str:
+    # on tronque AVANT le regex (un texte géant ne doit pas bloquer le robot) ;
+    # « [^<>]* » évite tout retour arrière coûteux sur un « < » orphelin
+    text = re.sub(r"<[^<>]*>", " ", (text or "")[:limit])
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def clean_url(url: str) -> str:
+    """URL canonique : pas de paramètres de pistage, pas de double « / », https."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    parts = urlparse(url)
+    path = re.sub(r"/{2,}", "/", parts.path)
+    query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                       if not k.lower().startswith(("utm_", "xy"))])
+    scheme = "https" if parts.scheme in ("http", "https") else parts.scheme
+    return urlunparse((scheme, parts.netloc.lower(), path, parts.params, query, ""))
 
 
 def http_get(session, url: str, **kwargs):
     headers = {"User-Agent": USER_AGENT, **kwargs.pop("headers", {})}
     r = session.get(url, headers=headers, timeout=kwargs.pop("timeout", TIMEOUT), **kwargs)
     r.raise_for_status()
+    if len(r.content) > MAX_BYTES:
+        raise ValueError(f"réponse trop volumineuse ({len(r.content)} octets)")
     return r
+
+
+def valid_time(when: datetime, now: datetime) -> bool:
+    return OLDEST_VALID <= when <= now + timedelta(minutes=5)
+
+
+class Source:
+    """Réglages communs : nom, groupe propriétaire, fréquence de collecte."""
+
+    name = "source"
+    group = ""
+    poll_seconds: float | None = None  # None = fréquence par défaut du service
 
 
 def _compile(patterns) -> re.Pattern | None:
@@ -62,19 +103,34 @@ def _compile(patterns) -> re.Pattern | None:
 
 
 # ======================================================================== RSS / Atom
-class RssSource:
+class RssSource(Source):
     def __init__(self, name: str, url: str, kind: str = NEWS, tier: int = 2, exclude=None, include=None,
-                 max_items: int = 50, assets=None, strip_prefix: str = ""):
+                 max_items: int = 50, assets=None, strip_prefix: str = "", strip_title=None, group: str = "",
+                 poll_seconds: float | None = None, headers: dict | None = None):
         self.name, self.url, self.kind, self.tier = name, url, kind, tier
-        self.strip_prefix = strip_prefix
+        self.group = group or name
+        self.poll_seconds = poll_seconds
+        self.headers = headers or {}
+        patterns = list(strip_title or []) + ([re.escape(strip_prefix)] if strip_prefix else [])
+        self.strip_title = re.compile(r"^\s*(?:" + "|".join(patterns) + r")\s*", re.IGNORECASE) if patterns else None
         self.exclude, self.include = _compile(exclude), _compile(include)
         self.max_items = max_items
         self.assets = set(assets or [])  # actifs imposés (ex : flux « or » -> XAU)
+        self._etag = self._modified = None
+        self._last: list[NewsItem] = []
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
         import feedparser
 
-        feed = feedparser.parse(http_get(session, self.url).content)
+        headers = dict(self.headers)
+        if self._etag:
+            headers["If-None-Match"] = self._etag
+        if self._modified:
+            headers["If-Modified-Since"] = self._modified
+        r = http_get(session, self.url, headers=headers)
+        if r.status_code == 304:  # rien de neuf depuis la dernière fois
+            return list(self._last)
+        feed = feedparser.parse(r.content)
         if feed.bozo and not feed.entries:
             raise ValueError(f"flux illisible : {feed.bozo_exception}")
         items = []
@@ -82,9 +138,15 @@ class RssSource:
             stamp = e.get("published_parsed") or e.get("updated_parsed")
             if not stamp:
                 continue  # sans date on ne peut pas juger la fraîcheur
+            try:
+                published = datetime(*stamp[:6], tzinfo=timezone.utc)
+            except (ValueError, OverflowError, TypeError):
+                continue  # date sentinelle (an 0 ou 10000) : on ignore juste cette entrée
+            if not valid_time(published, now):
+                continue  # date absurde (1899) ou dans le futur (agenda déguisé en news)
             title = clean_text(e.get("title"))
-            if self.strip_prefix and title.startswith(self.strip_prefix):
-                title = title[len(self.strip_prefix):].strip()
+            if self.strip_title:
+                title = self.strip_title.sub("", title).strip()
             summary = clean_text(e.get("summary") or e.get("description"))
             if len(summary) < 40 or summary.lower().startswith("read more"):
                 # certains flux mettent le vrai résumé dans un champ à eux (ex : fxstnewsns:summary)
@@ -97,21 +159,29 @@ class RssSource:
                 continue
             if self.include and not self.include.search(haystack):
                 continue
+            assets = set(self.assets)
+            pair = next((v for k, v in e.items() if k.endswith("_pair") and isinstance(v, str) and v.strip()), "")
+            if pair:  # ex : FXStreet indique directement la paire concernée
+                assets |= symbol_assets(pair.strip())
             items.append(NewsItem(
-                source=self.name, kind=self.kind, tier=self.tier, title=title,
-                url=e.get("link", ""), published=datetime(*stamp[:6], tzinfo=timezone.utc),
-                summary=summary, assets=set(self.assets),
+                source=self.name, kind=self.kind, tier=self.tier, title=title, url=clean_url(e.get("link", "")),
+                published=published, summary=summary, assets=assets, group=self.group,
             ))
-        return items
+        self._etag = r.headers.get("ETag")
+        self._modified = r.headers.get("Last-Modified")
+        self._last = items
+        return list(items)
 
 
-class SitemapNewsSource:
+class SitemapNewsSource(Source):
     """Plan de site « Google News » (ex : Reuters, qui n'a plus de flux RSS depuis 2020).
     Contient les titres de la dernière heure, sans résumé."""
 
     def __init__(self, name: str, url: str, tier: int = 1, url_include=None, url_exclude=None,
-                 kind: str = NEWS):
+                 kind: str = NEWS, group: str = "", poll_seconds: float | None = None):
         self.name, self.url, self.tier, self.kind = name, url, tier, kind
+        self.group = group or name
+        self.poll_seconds = poll_seconds
         self.url_include, self.url_exclude = _compile(url_include), _compile(url_exclude)
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
@@ -119,7 +189,10 @@ class SitemapNewsSource:
 
         ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9",
               "n": "http://www.google.com/schemas/sitemap-news/0.9"}
-        root = ET.fromstring(http_get(session, self.url).content)
+        content = http_get(session, self.url).content
+        if b"<!DOCTYPE" in content[:2000] or b"<!ENTITY" in content[:5000]:
+            raise ValueError("plan de site refusé : déclaration DTD/entités")  # protection « billion laughs »
+        root = ET.fromstring(content)
         items = []
         for u in root.findall("s:url", ns):
             loc = (u.findtext("s:loc", "", ns) or "").strip()
@@ -136,41 +209,50 @@ class SitemapNewsSource:
                 when = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00")).astimezone(timezone.utc)
             except ValueError:
                 continue
-            if title:
-                items.append(NewsItem(source=self.name, kind=self.kind, tier=self.tier, title=title, url=loc,
-                                      published=when))
+            if title and valid_time(when, now):
+                items.append(NewsItem(source=self.name, kind=self.kind, tier=self.tier, title=title,
+                                      url=clean_url(loc), published=when, group=self.group))
         return items
 
 
 # ======================================================================== calendrier
-class ForexFactoryCalendar:
-    """Export hebdomadaire public de ForexFactory (faireconomy). Le site limite le
-    nombre de téléchargements : on garde une copie locale et on ne la rafraîchit
-    qu'une fois par `min_interval_minutes`. En cas d'échec, l'ancienne copie sert."""
+class ForexFactoryCalendar(Source):
+    """Export hebdomadaire public de ForexFactory (faireconomy). Le site limite à
+    2 téléchargements par 5 minutes et renvoie sinon une page HTML « Request Denied » :
+    on garde une copie locale, rafraîchie au plus une fois par `min_interval_minutes`.
+    Une copie de plus de `max_stale_hours` n'est JAMAIS utilisée : mieux vaut signaler
+    l'absence de calendrier que croire qu'il n'y a aucune annonce."""
 
     name = "ForexFactory (calendrier)"
     URLS = ("https://nfs.faireconomy.media/ff_calendar_thisweek.json",)
 
-    def __init__(self, store, min_interval_minutes: int = 60, urls=None):
+    def __init__(self, store, min_interval_minutes: int = 60, urls=None, max_stale_hours: float = 26):
         self.store = store
+        self.group = self.name
         self.min_interval = timedelta(minutes=min_interval_minutes)
+        self.max_stale = timedelta(hours=max_stale_hours)
         self.urls = tuple(urls or self.URLS)
+        self.data_time: datetime | None = None  # date de téléchargement des données servies
 
-    def _payload(self, session, url: str, now: datetime) -> str:
+    def _payload(self, session, url: str, now: datetime) -> tuple[str, datetime]:
         key = f"calendar:{url}"
         cached = self.store.get(key)
-        if cached and now - datetime.fromisoformat(cached[1]) < self.min_interval:
-            return cached[0]
+        cached_at = datetime.fromisoformat(cached[1]) if cached else None
+        if cached and now - cached_at < self.min_interval:
+            return cached[0], cached_at
         try:
             text = http_get(session, url).text
-            json.loads(text)  # vérifie que c'est bien du JSON (pas une page de blocage)
-        except Exception:
-            if cached:
-                log.warning("Calendrier %s indisponible, utilisation de la copie locale", url)
-                return cached[0]
-            raise
+            if not text.lstrip().startswith("["):
+                raise ValueError("réponse non JSON (limite de téléchargement atteinte ?)")
+            json.loads(text)
+        except Exception as e:
+            if cached and now - cached_at <= self.max_stale:
+                log.warning("Calendrier %s indisponible (%s), copie locale de %s utilisée", url, e,
+                            cached_at.strftime("%d/%m %H:%M"))
+                return cached[0], cached_at
+            raise RuntimeError("calendrier indisponible" + (" et copie locale périmée" if cached else "")) from e
         self.store.put(key, text, now)
-        return text
+        return text, now
 
     @staticmethod
     def parse(payload: str) -> list[CalendarEvent]:
@@ -178,61 +260,71 @@ class ForexFactoryCalendar:
         for e in json.loads(payload):
             try:
                 when = datetime.fromisoformat(e["date"]).astimezone(timezone.utc)
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, TypeError):
                 continue
             events.append(CalendarEvent(
-                title=e.get("title", "").strip(), currency=(e.get("country") or "").upper(), time=when,
-                impact=e.get("impact", ""), forecast=e.get("forecast") or "", previous=e.get("previous") or "",
-                actual=e.get("actual") or "",
+                title=clean_text(e.get("title"), 200), currency=clean_text(e.get("country"), 8).upper(), time=when,
+                impact=clean_text(e.get("impact"), 20), forecast=clean_text(e.get("forecast"), 40),
+                previous=clean_text(e.get("previous"), 40), actual=clean_text(e.get("actual"), 40),
             ))
         return events
 
     def fetch(self, session, now: datetime) -> list[CalendarEvent]:
         events: dict[str, CalendarEvent] = {}
-        errors = []
+        errors, oldest = [], None
         for url in self.urls:
             try:
-                for ev in self.parse(self._payload(session, url, now)):
+                payload, stamp = self._payload(session, url, now)
+                for ev in self.parse(payload):
                     events[ev.id] = ev
+                oldest = stamp if oldest is None else min(oldest, stamp)
             except Exception as e:
                 errors.append(e)
         if errors and not events:
             raise errors[0]
+        if not events or max(e.time for e in events.values()) < now - timedelta(days=3):
+            raise RuntimeError("calendrier périmé : il ne couvre pas la semaine en cours")
+        self.data_time = oldest
         return sorted(events.values(), key=lambda e: e.time)
 
 
 # ======================================================================== réseaux sociaux
-class StockTwitsSource:
+class StockTwitsSource(Source):
     """Flux public StockTwits par symbole (sans clé). Bruyant : uniquement des
     posts d'utilisateurs suivis, et toujours traités comme des rumeurs à confirmer."""
 
     URL = "https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json"
 
-    def __init__(self, symbols: dict[str, list[str]], name: str = "StockTwits"):
+    def __init__(self, symbols: dict[str, list[str]], name: str = "StockTwits", poll_seconds: float | None = 900):
         self.symbols = symbols  # symbole StockTwits -> actifs (ex : {"SPY": ["US_INDICES"]})
-        self.name = name
+        self.name = self.group = name
+        self.poll_seconds = poll_seconds  # limite : 200 requêtes / heure / IP
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
         items = []
         for symbol, assets in self.symbols.items():
             data = http_get(session, self.URL.format(symbol=quote(symbol))).json()
             for m in data.get("messages", []):
+                try:
+                    created = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00"))
+                except (KeyError, ValueError, AttributeError):
+                    continue
                 user = m.get("user") or {}
                 sentiment = ((m.get("entities") or {}).get("sentiment") or {}).get("basic")
                 items.append(NewsItem(
                     source=f"{self.name} @{user.get('username', '?')}", kind=SOCIAL,
                     tier=3, title=clean_text(m.get("body"))[:280],
                     url=f"https://stocktwits.com/{user.get('username', '')}/message/{m.get('id')}",
-                    published=datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")),
+                    published=created,
                     engagement={"likes": int((m.get("likes") or {}).get("total", 0)),
                                 "followers": int(user.get("followers", 0))},
-                    author=user.get("username", ""), assets=set(assets),
+                    author=user.get("username", ""), assets=set(assets), group=f"{self.name} @{user.get('username', '?')}",
                     summary=f"Sentiment déclaré : {sentiment}" if sentiment else "",
                 ))
         return items
 
 
-class RedditSource:
+class RedditSource(Source):
     """Reddit. Avec une appli « script » (client_id/secret gratuits sur
     reddit.com/prefs/apps) on passe par l'API officielle OAuth ; sinon on tente
     les flux JSON publics, souvent bloqués."""
@@ -243,6 +335,7 @@ class RedditSource:
                  user_agent: str = "windows:tradingbot-news:1.0 (by /u/unknown)", listing: str = "hot",
                  limit: int = 25, name: str = "Reddit"):
         self.subreddits, self.listing, self.limit, self.name = subreddits, listing, limit, name
+        self.group = name
         self.client_id, self.client_secret, self.user_agent = client_id, client_secret, user_agent
         self._token: tuple[str, float] | None = None
 
@@ -281,13 +374,14 @@ class RedditSource:
         return items
 
 
-class XSource:
+class XSource(Source):
     """X (Twitter) – API payante : recherche récente sur une liste de comptes."""
 
     URL = "https://api.x.com/2/tweets/search/recent"
 
     def __init__(self, bearer_token: str, accounts: list[str], official_accounts=(), name: str = "X"):
         self.token, self.accounts, self.name = bearer_token, accounts, name
+        self.group = name
         self.official = {a.lower() for a in official_accounts}
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
@@ -302,6 +396,10 @@ class XSource:
             }).json()
             users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
             for t in data.get("data", []):
+                try:
+                    created = datetime.fromisoformat(t["created_at"].replace("Z", "+00:00"))
+                except (KeyError, ValueError, AttributeError):
+                    continue
                 u = users.get(t.get("author_id"), {})
                 name = u.get("username", "?")
                 official = name.lower() in self.official
@@ -309,16 +407,63 @@ class XSource:
                 items.append(NewsItem(
                     source=f"X @{name}", kind=OFFICIAL if official else SOCIAL, tier=1 if official else 3,
                     title=clean_text(t.get("text"))[:280], url=f"https://x.com/{name}/status/{t['id']}",
-                    published=datetime.fromisoformat(t["created_at"].replace("Z", "+00:00")),
+                    published=created,
                     engagement={"likes": int(metrics.get("like_count", 0)),
                                 "followers": int(u.get("public_metrics", {}).get("followers_count", 0))},
-                    author=name,
+                    author=name, group=f"X @{name}",
                 ))
         return items
 
 
+class BlueskyAuthorSource(Source):
+    """Comptes Bluesky vérifiés par leur nom de domaine (reuters.com, apnews.com,
+    federalreserve.gov…) : impossibles à usurper, gratuits, sans clé."""
+
+    URL = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+
+    def __init__(self, accounts: list[dict], name: str = "Bluesky", poll_seconds: float | None = None):
+        # accounts : [{"handle": "apnews.com", "name": "AP", "tier": 1, "kind": "news", "group": "AP"}]
+        self.accounts, self.name, self.group, self.poll_seconds = accounts, name, name, poll_seconds
+
+    def fetch(self, session, now: datetime) -> list[NewsItem]:
+        items, errors = [], []
+        for acc in self.accounts:
+            try:
+                data = http_get(session, self.URL, params={"actor": acc["handle"], "limit": 30,
+                                                           "filter": "posts_no_replies"}).json()
+            except Exception as e:
+                errors.append(e)
+                continue
+            for entry in data.get("feed", []):
+                if entry.get("reason"):  # repost d'un autre compte
+                    continue
+                post = entry.get("post") or {}
+                record = post.get("record") or {}
+                try:
+                    when = datetime.fromisoformat(record["createdAt"].replace("Z", "+00:00")).astimezone(timezone.utc)
+                except (KeyError, ValueError):
+                    continue
+                if not valid_time(when, now):
+                    continue
+                ext = (post.get("embed") or {}).get("external") or {}
+                text = clean_text(record.get("text"))
+                rkey = post.get("uri", "").rsplit("/", 1)[-1]
+                label = acc.get("name") or acc["handle"]
+                items.append(NewsItem(
+                    source=f"{label} (Bluesky)", kind=acc.get("kind", NEWS), tier=int(acc.get("tier", 1)),
+                    title=clean_text(ext.get("title")) or text[:280],
+                    summary=clean_text(ext.get("description")) or (text if ext.get("title") else ""),
+                    url=f"https://bsky.app/profile/{acc['handle']}/post/{rkey}", published=when,
+                    engagement={"likes": int(post.get("likeCount", 0)), "reposts": int(post.get("repostCount", 0))},
+                    author=acc["handle"], group=acc.get("group") or label, assets=set(acc.get("assets", [])),
+                ))
+        if errors and not items:
+            raise errors[0]
+        return items
+
+
 # ======================================================================== API de news
-class GdeltSource:
+class GdeltSource(Source):
     """GDELT DOC 2.0 : moteur mondial gratuit, sans clé. La fiabilité de chaque
     article est déduite de son domaine (Reuters, Bloomberg… = tier 1)."""
 
@@ -327,6 +472,7 @@ class GdeltSource:
     def __init__(self, query: str, timespan: str = "2h", max_records: int = 75, min_tier: int = 2,
                  name: str = "GDELT"):
         self.query, self.timespan, self.max_records, self.min_tier, self.name = query, timespan, max_records, min_tier, name
+        self.group = name
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
         r = http_get(session, self.URL, params={
@@ -351,18 +497,21 @@ class GdeltSource:
         return items
 
 
-class FinnhubNewsSource:
+class FinnhubNewsSource(Source):
     """Finnhub (clé gratuite sur finnhub.io) : flux de news forex et marchés."""
 
     URL = "https://finnhub.io/api/v1/news"
 
     def __init__(self, api_key: str, categories=("forex", "general"), name: str = "Finnhub"):
         self.api_key, self.categories, self.name = api_key, categories, name
+        self.group = name
 
     def fetch(self, session, now: datetime) -> list[NewsItem]:
         items = []
         for cat in self.categories:
-            for a in http_get(session, self.URL, params={"category": cat, "token": self.api_key}).json():
+            # clé dans un en-tête et non dans l'URL : elle n'apparaît pas dans les messages d'erreur
+            for a in http_get(session, self.URL, params={"category": cat},
+                              headers={"X-Finnhub-Token": self.api_key}).json():
                 src = a.get("source") or self.name
                 items.append(NewsItem(
                     source=src, kind=NEWS, tier=domain_tier(a.get("url", ""), default=domain_tier(src.lower(), 2)),

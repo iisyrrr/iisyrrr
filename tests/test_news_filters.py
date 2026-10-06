@@ -102,3 +102,20 @@ def test_blackout_window():
 def test_upcoming_sorted_and_filtered():
     evs = [ev("B", minutes=120), ev("A", minutes=60), ev("Low one", impact="Low"), ev("Past", minutes=-5)]
     assert [e.title for e in upcoming(evs, {"USD"}, NOW, hours=24)] == ["A", "B"]
+
+
+def test_direction_sign_unknown_base_and_named_metals():
+    assert symbol_direction_sign("ZARJPY", "JPY") == -1  # JPY fort -> ZARJPY baisse
+    assert symbol_direction_sign("GOLD", "USD") == -1
+    assert symbol_direction_sign("GOLD", "XAU") == 1
+    assert symbol_direction_sign("SILVER.r", "XAG") == 1
+    assert symbol_assets("US2000") == {"US_INDICES", "USD"}
+    assert symbol_direction_sign("MYGOLD", "USD", {"MYGOLD": ["XAU", "USD"]}) == -1
+    assert symbol_direction_sign("MYIDX", "USD", {"MYIDX": ["US_INDICES", "USD"]}) == 0
+    assert symbol_direction_sign("X", "USD", {"X": {"XAU": 1, "USD": -1}}) == -1
+
+
+def test_metals_and_oil_are_not_currencies():
+    from bot.news.calendar import relevant_currencies
+    assert relevant_currencies({"XAU", "USD"}, BlackoutSettings()) == {"USD"}
+    assert relevant_currencies({"OIL"}, BlackoutSettings()) == set()

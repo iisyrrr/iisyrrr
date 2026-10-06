@@ -6,6 +6,8 @@ import threading
 
 import requests
 
+from .secrets import mask
+
 log = logging.getLogger(__name__)
 
 
@@ -40,7 +42,7 @@ class TelegramNotifier:
                 self._call("sendMessage", chat_id=self.chat_id, text=text[i : i + 4000],
                            disable_web_page_preview=True)
             except requests.RequestException as e:
-                log.warning("Envoi Telegram échoué : %s", e)
+                log.warning("Envoi Telegram échoué : %s", mask(str(e)).replace(self.token, "***"))
                 ok = False
         return ok
 
@@ -54,7 +56,7 @@ class TelegramNotifier:
         try:
             updates = self._call("getUpdates", **params).get("result", [])
         except requests.RequestException as e:
-            log.warning("Lecture Telegram échouée : %s", e)
+            log.warning("Lecture Telegram échouée : %s", mask(str(e)).replace(self.token, "***"))
             return []
         commands = []
         for upd in updates:

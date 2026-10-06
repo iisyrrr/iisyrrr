@@ -22,10 +22,15 @@ class NewsItem:
     summary: str = ""
     engagement: dict = field(default_factory=dict)  # likes, score, commentaires, abonnés…
     author: str = ""
+    group: str = ""  # propriétaire de la source : Reuters sur Bluesky et Reuters en direct = même groupe
     # remplis par le filtre
     assets: set[str] = field(default_factory=set)
     corroborations: int = 1  # nombre de sources différentes qui rapportent la même info
     corroborated_by_tier: int = 3  # meilleur tier parmi les sources qui la rapportent
+    weight: float = 0.0  # fiabilité combinée des groupes indépendants qui la rapportent (0…1)
+    groups: dict = field(default_factory=dict)  # groupe propriétaire -> poids, pour la combinaison
+    member_ids: set = field(default_factory=set)  # ids de toutes les copies de la même info
+    category: str = "news"  # news | analysis (analyse/prévision) | recap (récapitulatif)
     score: float = 0.0
     flags: list[str] = field(default_factory=list)
     # remplis par l'IA (optionnelle)
@@ -37,10 +42,22 @@ class NewsItem:
         return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
     @property
+    def owner(self) -> str:
+        return self.group or self.source
+
+    @property
+    def social_only(self) -> bool:
+        """Rapportée uniquement par les réseaux sociaux : jamais d'alerte ni d'effet sur le trading,
+        même si l'IA la juge crédible (l'IA peut déclasser, jamais promouvoir)."""
+        return self.kind == SOCIAL and self.corroborated_by_tier > 2
+
+    @property
     def is_rumor(self) -> bool:
+        if self.social_only:
+            return True
         if self.analysis is not None:
             return bool(self.analysis.get("is_rumor"))
-        return self.kind == SOCIAL and self.corroborated_by_tier > 2
+        return False
 
 
 @dataclass
@@ -68,3 +85,5 @@ class SymbolContext:
     top_items: list[NewsItem]
     next_event: CalendarEvent | None
     blackout_event: CalendarEvent | None  # événement majeur trop proche -> pas d'entrée
+    calendar_ok: bool = True  # False = calendrier absent ou périmé : la protection ne peut pas être garantie
+    recognized: bool = True  # False = symbole non reconnu : aucune devise associée

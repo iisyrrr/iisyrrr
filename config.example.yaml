@@ -24,6 +24,7 @@ trading:
   magic: 20261005                    # identifiant des ordres du robot
   deviation_points: 20               # slippage max accepté
   max_spread_points: 30              # pas d'entrée si le spread est plus large
+  spread_spike_factor: 2.5           # ni s'il dépasse 2,5 x sa valeur habituelle (news surprise)
   poll_seconds: 10
 
 risk:
@@ -52,7 +53,8 @@ optimizer:                    # auto-amélioration
 # ============================================================================
 news:
   enabled: true
-  poll_minutes: 5               # fréquence de collecte
+  contact: ""                   # ton e-mail : demandé par certains sites officiels (BLS) pour les robots
+  poll_minutes: 5               # fréquence de collecte (FinancialJuice : chaque minute)
   timezone: "Europe/Paris"      # heure affichée dans les alertes et le briefing
   morning_brief_time: "07:30"   # briefing du matin sur Telegram ("" = désactivé)
   brief_weekends: false
@@ -67,6 +69,7 @@ news:
   sentiment_filter: warn
   sentiment_threshold: 0.5      # sentiment de -1 à +1 ; |sentiment| >= 0.5 = clair
   auto_min_trades: 30
+  auto_lookback_days: 90        # le mode auto juge sur les 90 derniers jours (il peut changer d'avis)
 
   # Pas de nouvelle position autour des annonces à fort impact sur les devises du symbole
   blackout:
@@ -75,7 +78,9 @@ news:
     minutes_before: 30
     minutes_after: 30
     major_minutes_before: 45    # NFP, CPI, décisions de banques centrales…
-    major_minutes_after: 60
+    major_minutes_after: 60     # conférences de presse : couvertes jusqu'à 30 min après la fin
+    breaking_minutes: 15        # après une info urgente confirmée par une source de premier plan
+    fail_closed: true           # calendrier indisponible/périmé = AUCUNE nouvelle entrée (recommandé)
 
   # Filtrage par IA (Claude) : pertinence, impact, crédibilité, rumeur ou fait,
   # effet probable sur chaque devise, résumé en français, briefing du matin.
@@ -88,18 +93,23 @@ news:
     brief_effort: medium        # briefing du matin
     max_items_per_cycle: 25
 
-  # Les sources par défaut (Fed, BCE, BoE, Reuters, Bloomberg, WSJ, CNBC, FT,
-  # FinancialJuice, FXStreet, investingLive, Investing.com, StockTwits) sont
-  # activées automatiquement. Pour en AJOUTER sans les remplacer :
+  # 34 sources par défaut sont activées automatiquement (voir README). Une source
+  # n'est interrogée utilement que si tu trades un actif qu'elle concerne.
+  # Pour en AJOUTER sans les remplacer :
   extra_sources: []
-  #  - type: reddit             # appli "script" gratuite sur https://www.reddit.com/prefs/apps
-  #    subreddits: [Forex, economics]
+  #  - type: x                  # API X, payante à la lecture (~45-75 $/mois pour 10-15 comptes)
+  #    bearer_token: ""
+  #    accounts: [federalreserve, ecb, bankofengland, USTreasury, BLS_gov, DeItaone, FirstSquawk,
+  #               LiveSquawk, NickTimiraos, Reuters, WSJmarkets, CNBCnow, KitcoNewsNOW]
+  #    official_accounts: [federalreserve, ecb, bankofengland, USTreasury, BLS_gov]
+  #  - type: bluesky            # comptes vérifiés par nom de domaine, gratuits
+  #    accounts:
+  #      - {handle: reuters.com, name: Reuters, tier: 1, group: Reuters}
+  #      - {handle: federalreserve.gov, name: Fed, tier: 1, kind: official, group: Fed}
+  #  - type: reddit             # DÉCONSEILLÉ : création d'applis fermée, accès public coupé (mars 2027)
+  #    subreddits: [economics]
   #    client_id: ""
   #    client_secret: ""
-  #  - type: x                  # API X (payante)
-  #    bearer_token: ""
-  #    accounts: [federalreserve, ecb, bankofengland]
-  #    official_accounts: [federalreserve, ecb, bankofengland]
   #  - type: finnhub            # clé gratuite sur finnhub.io
   #    api_key: ""
   #  - type: rss                # n'importe quel flux RSS
