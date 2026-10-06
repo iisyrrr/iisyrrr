@@ -26,6 +26,7 @@ class SymbolSpec:
     spread_points: int
     bid: float
     ask: float
+    tick_time: float = 0.0  # horodatage du dernier prix reçu (figé quand le marché est fermé)
 
 
 @dataclass
@@ -136,6 +137,7 @@ class MT5Broker:
             spread_points=int(round((tick.ask - tick.bid) / info.point)),
             bid=tick.bid,
             ask=tick.ask,
+            tick_time=float(getattr(tick, "time_msc", 0) or getattr(tick, "time", 0)),
         )
 
     def account(self) -> Account:

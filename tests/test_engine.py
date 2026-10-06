@@ -377,3 +377,12 @@ def test_news_retry_restores_trading(news_bot):
     new_bar(bot, broker)
     assert bot.news is not None and not bot.news_required
     assert any("redémarrée" in m for m in notifier.sent)
+
+
+def test_frozen_weekend_prices_do_not_fill_spread_baseline(make_bot):
+    bot, broker, _ = make_bot()
+    frozen = SymbolSpec("EURUSD", 0.00001, 5, 0.01, 100, 0.01, 0, 40, 1.1, 1.1004, tick_time=1000.0)
+    broker.spec = lambda symbol: frozen
+    for _ in range(50):
+        bot.process_symbol("EURUSD")
+    assert len(bot._spreads["EURUSD"]) == 1  # 50 lectures du même prix figé = 1 seule mesure

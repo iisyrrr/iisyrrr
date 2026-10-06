@@ -61,6 +61,7 @@ class Bot:
         self._last_sentiment_mode: str | None = None
         self._throttle: dict[str, float] = {}
         self._spreads: dict[str, deque] = {}
+        self._last_tick_time: dict[str, float] = {}
         self._news_builder = None  # pour retenter le démarrage de la veille si elle a échoué
         self._news_retry_at = 0.0
 
@@ -172,7 +173,11 @@ class Bot:
         tf = self.t["timeframe"]
         if self.t.get("spread_spike_factor"):
             try:
-                self.record_spread(symbol, self.broker.spec(symbol).spread_points)
+                spec = self.broker.spec(symbol)
+                # uniquement les prix NOUVEAUX : un marché fermé (week-end) renvoie le même prix figé
+                if not spec.tick_time or spec.tick_time != self._last_tick_time.get(symbol):
+                    self._last_tick_time[symbol] = spec.tick_time
+                    self.record_spread(symbol, spec.spread_points)
             except Exception:
                 log.debug("Spread de %s indisponible", symbol)
         bar_time = self.broker.rates(symbol, tf, 2).index[-1]
